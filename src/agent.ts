@@ -59,18 +59,6 @@ function getAgent(sessionKey: string): Agent {
     if (runId) bridgeAndPublish(event, runId, sessionKey);
   });
 
-  // Restore conversation history from JSONL
-  const history = loadContext(sessionKey);
-  if (history.length > 0) {
-    const restored = history.map((msg) => ({
-      role: msg.role,
-      content: msg.content,
-      timestamp: msg.timestamp || Date.now(),
-    }));
-    agent.state.messages = restored as any;
-    console.log(`[agent] Restored ${restored.length} messages for ${sessionKey}`);
-  }
-
   agents.set(sessionKey, agent);
   return agent;
 }
