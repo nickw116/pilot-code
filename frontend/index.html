@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <title>Pilot Code</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+  <div id="app"></div>
+  <script>
+window.onerror = function(msg, url, line, col, err) {
+  document.body.innerHTML = '<div style="padding:20px;color:red;background:#fff;font:16px monospace;white-space:pre-wrap;word-break:break-all;">JS ERROR: ' + msg + '\nFile: ' + url + ':' + line + ':' + col + '\nStack: ' + (err && err.stack || 'N/A') + '</div>';
+  return true;
+};
+window.addEventListener('unhandledrejection', function(e) {
+  document.body.innerHTML = '<div style="padding:20px;color:red;background:#fff;font:16px monospace;white-space:pre-wrap;word-break:break-all;">UNHANDLED PROMISE: ' + e.reason + '</div>';
+});
+</script>
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>

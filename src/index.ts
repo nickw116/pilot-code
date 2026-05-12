@@ -1,6 +1,8 @@
 import "dotenv/config";
 import express from "express";
 import crypto from "crypto";
+import fs from "fs";
+import path from "path";
 import { registerSubscriber, unregisterSubscriber, publish } from "./sse.js";
 import * as agentModule from "./agent.js";
 import * as authMod from "./auth.js";
@@ -206,25 +208,66 @@ app.get("/api/history", auth, (req, res) => {
 
 app.get("/api/models", auth, (_req, res) => {
   res.json({
-    models: [
-      { id: "xiaomi/mimo-v2.5-pro", name: "MiMo V2.5 Pro", alias: "MiMo Pro" },
-      { id: "deepseek/deepseek-v4-flash", name: "DeepSeek V4 Flash", alias: "DeepSeek" },
-    ],
+    models: agentModule.getModelList(),
   });
 });
 
-app.post("/api/model/switch", auth, (_req, res) => {
-  res.json({ ok: true });
+app.post("/api/model/switch", auth, (req, res) => {
+  const { model, session_key } = req.body || {};
+  if (!model || !session_key) {
+    return res.status(400).json({ detail: "Missing model or session_key" });
+  }
+  const ok = agentModule.switchModel(session_key, model);
+  if (!ok) return res.status(400).json({ detail: "Unknown model" });
+  res.json({ ok: true, model });
 });
 
 // --- File transfer ---
 
-app.post("/api/upload", auth, (_req, res) => {
-  res.json({ url: "", detail: "not implemented in MVP" });
+const WORKSPACE = path.resolve(process.env.WORKSPACE_DIR || path.join(import.meta.dirname, "..", "data", "workspace"));
+const UPLOAD_DIR = path.join(WORKSPACE, "uploads");
+
+app.post("/api/upload", auth, (req, res) => {
+  // Simple base64 upload for MVP
+  const { filename, content_b64 } = req.body || {};
+  if (!filename || !content_b64) {
+    return res.status(400).json({ detail: "Missing filename or content_b64" });
+  }
+  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+  const safeName = path.basename(filename);
+  const filePath = path.join(UPLOAD_DIR, safeName);
+  fs.writeFileSync(filePath, Buffer.from(content_b64, "base64"));
+  const relativePath = path.relative(WORKSPACE, filePath);
+  res.json({ url: `/api/download?path=${encodeURIComponent(relativePath)}`, filename: safeName });
 });
 
-app.get("/api/download", auth, (_req, res) => {
-  res.status(404).json({ detail: "not implemented in MVP" });
+app.get("/api/download", auth, (req, res) => {
+  const filePath = req.query.path as string;
+  const url = req.query.url as string;
+  const filename = (req.query.filename as string) || "download";
+
+  if (filePath) {
+    const resolved = path.resolve(WORKSPACE, filePath);
+    if (!resolved.startsWith(WORKSPACE)) {
+      return res.status(403).json({ detail: "Path escapes workspace" });
+    }
+    if (!fs.existsSync(resolved)) return res.status(404).json({ detail: "Not found" });
+    return res.download(resolved, filename);
+  }
+
+  if (url) {
+    return res.redirect(url);
+  }
+
+  res.status(400).json({ detail: "Missing path or url" });
+});
+
+app.get("/api/local-file", auth, (req, res) => {
+  const filePath = req.query.path as string;
+  if (!filePath) return res.status(400).json({ detail: "Missing path" });
+  const resolved = path.resolve(filePath);
+  if (!fs.existsSync(resolved)) return res.status(404).json({ detail: "Not found" });
+  res.sendFile(resolved);
 });
 
 // --- Context stats ---
@@ -239,8 +282,19 @@ app.get("/api/context/stats", auth, (req, res) => {
 // --- Health ---
 
 app.get("/api/health", (_req, res) => {
-  res.json({ status: "ok", version: "0.2.0" });
+  res.json({ status: "ok", version: "0.3.0" });
 });
+
+// --- Serve frontend (production) ---
+
+const FRONTEND_DIR = path.join(import.meta.dirname, "..", "frontend", "dist");
+if (fs.existsSync(FRONTEND_DIR)) {
+  app.use(express.static(FRONTEND_DIR));
+  app.get("*", (req, res, next) => {
+    if (req.path.startsWith("/api")) return next();
+    res.sendFile(path.join(FRONTEND_DIR, "index.html"));
+  });
+}
 
 // --- Start ---
 app.listen(PORT, () => {

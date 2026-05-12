@@ -153,3 +153,11 @@ export function appendContext(sessionKey: string, messages: ContextMessage[]): v
       .run(now / 1000, sessionKey);
   } catch {}
 }
+
+/** Update session title */
+export function updateSessionTitle(sessionKey: string, title: string): void {
+  try {
+    getDb().prepare("UPDATE sessions SET title = ? WHERE session_key = ? AND title = ''")
+      .run(title, sessionKey);
+  } catch {}
+}

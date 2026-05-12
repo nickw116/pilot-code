@@ -1,0 +1,35 @@
+/**
+ * 全局设计令牌（Design Tokens）
+ *
+ * 命名规范：
+ *   --color-*      颜色
+ *   --radius-*     圆角
+ *   --shadow-*     阴影
+ */
+:root {
+  /* ── Color: Primary ── */
+  --color-primary: #007AFF;
+  --color-primary-light: #3395FF;
+  --color-primary-dark: #0066CC;
+
+  /* ── Color: Background ── */
+  --color-bg: #FFFFFF;
+  --color-bg-secondary: #F4F5F7;
+
+  /* ── Color: Text ── */
+  --color-text: #1F1F1F;
+  --color-text-secondary: #8E8E8E;
+
+  /* ── Color: Border ── */
+  --color-border: #E5E5E5;
+
+  /* ── Radius ── */
+  --radius-sm: 8px;
+  --radius-md: 14px;
+  --radius-lg: 28px;
+
+  /* ── Shadow ── */
+  --shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.04);
+  --shadow-md: 0 4px 20px rgba(0, 0, 0, 0.05);
+  --shadow-lg: 0 8px 30px rgba(0, 0, 0, 0.08);
+}
