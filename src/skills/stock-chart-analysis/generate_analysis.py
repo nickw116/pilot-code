@@ -299,6 +299,102 @@ def fetch_gs_financials(code, market):
     }
 
 
+def fetch_gs_balance_sheet(code, market):
+    """国信资产负债表关键指标。market: SH/SZ。"""
+    resp = _gs_make_request(
+        "/gsnews/gsf10/financial/balanceSheet/1.0",
+        {"code": code, "market": market.upper(), "reportType": "Q0", "count": "2"},
+    )
+    if not resp:
+        return {}
+    result = resp.get("result", {})
+    if isinstance(result, list):
+        result = result[0] if result else {}
+    if result.get("code") != 0:
+        return {}
+    info = resp.get("balance") or resp.get("data", {}).get("info", [])
+    if not isinstance(info, list) or len(info) == 0:
+        return {}
+
+    def _field(rec, *keys):
+        for k in keys:
+            v = rec.get(k)
+            if v is not None and v != "" and v != "-":
+                return v
+        return None
+
+    latest = info[0] if isinstance(info[0], dict) else {}
+    total_assets = _safe_float(_field(latest, "totalAssets", "total_assets"))
+    total_liab = _safe_float(_field(latest, "totalLiab", "total_liabilities", "totalLiability"))
+    current_assets = _safe_float(_field(latest, "totalCurrentAssets", "currentAssets"))
+    current_liab = _safe_float(_field(latest, "totalCurrentLiab", "currentLiabilities", "currentLiability"))
+    net_assets = _safe_float(_field(latest, "totalParentEquity", "totalEquity", "totalShareholderEquity"))
+    bvps = _safe_float(_field(latest, "bvps", "bookValuePerShare", "netAssetPerShare"))
+
+    debt_ratio = (total_liab / total_assets) if total_assets and total_liab and total_assets > 0 else None
+    current_ratio = (current_assets / current_liab) if current_assets and current_liab and current_liab > 0 else None
+
+    return {
+        "total_assets": total_assets,
+        "total_liabilities": total_liab,
+        "debt_ratio": round(debt_ratio, 4) if debt_ratio is not None else None,
+        "current_ratio": round(current_ratio, 2) if current_ratio is not None else None,
+        "net_assets": net_assets,
+        "bvps": bvps,
+        "report_date": latest.get("year", latest.get("reportDate", latest.get("endDate", ""))),
+    }
+
+
+def fetch_gs_cashflow(code, market):
+    """国信现金流量表关键指标。market: SH/SZ。"""
+    resp = _gs_make_request(
+        "/gsnews/gsf10/financial/cashFlowStatement/1.0",
+        {"code": code, "market": market.upper(), "reportType": "Q0", "count": "2"},
+    )
+    if not resp:
+        return {}
+    result = resp.get("result", {})
+    if isinstance(result, list):
+        result = result[0] if result else {}
+    if result.get("code") != 0:
+        return {}
+    info = resp.get("cashflow") or resp.get("data", {}).get("info", [])
+    if not isinstance(info, list) or len(info) == 0:
+        return {}
+
+    def _field(rec, *keys):
+        for k in keys:
+            v = rec.get(k)
+            if v is not None and v != "" and v != "-":
+                return v
+        return None
+
+    latest = info[0] if isinstance(info[0], dict) else {}
+    prev = info[1] if len(info) > 1 and isinstance(info[1], dict) else {}
+
+    ocf = _safe_float(_field(latest, "netCashOperate", "operatingCashFlow", "operateCashFlow"))
+    icf = _safe_float(_field(latest, "netCashInvest", "investingCashFlow", "investCashFlow"))
+    fcf = _safe_float(_field(latest, "netCashFinance", "financingCashFlow", "financeCashFlow"))
+    prev_ocf = _safe_float(_field(prev, "netCashOperate", "operatingCashFlow", "operateCashFlow"))
+
+    fcf_yield = None
+    if ocf is not None and icf is not None:
+        free_cash_flow = ocf + icf
+    else:
+        free_cash_flow = None
+
+    ocf_yoy = ((ocf - prev_ocf) / abs(prev_ocf)) if ocf and prev_ocf and prev_ocf != 0 else None
+
+    return {
+        "operating_cash_flow": ocf,
+        "investing_cash_flow": icf,
+        "financing_cash_flow": fcf,
+        "free_cash_flow": free_cash_flow,
+        "ocf_yoy": round(ocf_yoy, 4) if ocf_yoy is not None else None,
+        "report_date": latest.get("year", latest.get("reportDate", latest.get("endDate", ""))),
+    }
+
+
 def _safe_float(val):
     if val is None or val == "" or val == "-":
         return None
@@ -646,36 +742,75 @@ def fetch_cyq_westock(full_symbol: str):
 class ChanLunAnalyzer:
     def __init__(self, df: pd.DataFrame):
         self.df = df.copy().reset_index(drop=True)
+        self.processed_klines = self._process_klines()
         self.top_fractals = []
         self.bottom_fractals = []
         self.pens = []
+        self.segments = []
         self.centers = []
         self.divergences = []
+        self.buy_sell_points = []
+
+    def _process_klines(self):
+        """K线包含处理：方向感知合并。"""
+        df = self.df.copy()
+        processed = []
+        i = 0
+        while i < len(df):
+            curr = df.iloc[i]
+            if not processed:
+                processed.append(curr)
+                i += 1
+                continue
+            prev = processed[-1]
+            if len(processed) >= 2:
+                direction = 1 if processed[-1]["high"] >= processed[-2]["high"] else -1
+            else:
+                direction = 1 if curr["close"] >= prev["close"] else -1
+            if curr["high"] >= prev["high"] and curr["low"] <= prev["low"]:
+                if direction > 0:
+                    new_high = max(curr["high"], prev["high"])
+                    new_low = max(curr["low"], prev["low"])
+                else:
+                    new_high = min(curr["high"], prev["high"])
+                    new_low = min(curr["low"], prev["low"])
+                processed[-1] = pd.Series({
+                    "date": curr["date"] if "date" in curr.index else prev.get("date", ""),
+                    "open": prev["open"],
+                    "high": new_high,
+                    "low": new_low,
+                    "close": curr["close"],
+                    "volume": prev.get("volume", 0) + curr.get("volume", 0),
+                })
+            else:
+                processed.append(curr)
+            i += 1
+        return pd.DataFrame(processed).reset_index(drop=True)
 
     def find_fractals(self):
-        """识别顶底分型。"""
-        n = len(self.df)
+        """在包含处理后的K线上识别顶底分型（4条件严格判断）。"""
+        kl = self.processed_klines
+        n = len(kl)
         for i in range(1, n - 1):
-            ph, ch, nh = self.df["high"].iloc[i - 1], self.df["high"].iloc[i], self.df["high"].iloc[i + 1]
-            pl, cl, nl = self.df["low"].iloc[i - 1], self.df["low"].iloc[i], self.df["low"].iloc[i + 1]
-
+            ch, ph, nh = kl["high"].iloc[i], kl["high"].iloc[i - 1], kl["high"].iloc[i + 1]
+            cl, pl, nl = kl["low"].iloc[i], kl["low"].iloc[i - 1], kl["low"].iloc[i + 1]
             if ch > ph and ch > nh and cl > pl and cl > nl:
-                self.top_fractals.append(i)
+                orig_idx = kl.index[i]
+                self.top_fractals.append(int(orig_idx))
             if cl < pl and cl < nl and ch < ph and ch < nh:
-                self.bottom_fractals.append(i)
+                orig_idx = kl.index[i]
+                self.bottom_fractals.append(int(orig_idx))
 
     def find_pens(self):
-        """识别笔：相邻且同向间隔至少2根K线。"""
+        """识别笔：顶底交替连接，最少间隔1根K线。"""
         points = []
         for idx in self.top_fractals:
             points.append({"idx": idx, "type": "top", "price": float(self.df["high"].iloc[idx])})
         for idx in self.bottom_fractals:
             points.append({"idx": idx, "type": "bottom", "price": float(self.df["low"].iloc[idx])})
         points.sort(key=lambda x: x["idx"])
-
         if len(points) < 2:
             return
-
         pen_start = points[0]
         for i in range(1, len(points)):
             if points[i]["type"] != pen_start["type"]:
@@ -690,8 +825,37 @@ class ChanLunAnalyzer:
                     })
                     pen_start = points[i]
 
+    def find_segments(self):
+        """识别线段：至少3笔，有重叠区域。"""
+        if len(self.pens) < 3:
+            return
+        i = 0
+        while i <= len(self.pens) - 3:
+            p1, p2, p3 = self.pens[i], self.pens[i + 1], self.pens[i + 2]
+            all_highs = [p1["start_price"], p1["end_price"], p2["start_price"],
+                         p2["end_price"], p3["start_price"], p3["end_price"]]
+            all_lows = list(all_highs)
+            for pen in [p1, p2, p3]:
+                s, e = pen["start_idx"], pen["end_idx"]
+                all_lows.extend([float(self.df["low"].iloc[min(s, e)]),
+                                 float(self.df["low"].iloc[max(s, e)])])
+            overlap_high = min(max(all_highs[j], all_highs[j + 1]) for j in range(0, len(all_highs) - 1, 2))
+            overlap_low = max(min(all_lows[j], all_lows[j + 1]) for j in range(0, len(all_lows) - 1, 2))
+            if overlap_high > overlap_low:
+                direction = "up" if p1["direction"] == "up" else "down"
+                self.segments.append({
+                    "start_idx": p1["start_idx"],
+                    "end_idx": p3["end_idx"],
+                    "direction": direction,
+                    "overlap_high": round(float(overlap_high), 2),
+                    "overlap_low": round(float(overlap_low), 2),
+                })
+                i += 3
+            else:
+                i += 1
+
     def find_centers(self):
-        """识别中枢：3笔重叠区间。"""
+        """识别中枢：3笔重叠区间（滑动窗口）。"""
         if len(self.pens) < 3:
             return
         for i in range(len(self.pens) - 2):
@@ -700,72 +864,147 @@ class ChanLunAnalyzer:
             end_idx = max(p1["end_idx"], p2["end_idx"], p3["end_idx"])
             if end_idx - start_idx < 5:
                 continue
-            highs = [p1["start_price"], p1["end_price"], p2["start_price"], p2["end_price"], p3["start_price"], p3["end_price"]]
-            lows = [self.df["low"].iloc[p1["start_idx"]], self.df["low"].iloc[p1["end_idx"]],
-                    self.df["low"].iloc[p2["start_idx"]], self.df["low"].iloc[p2["end_idx"]],
-                    self.df["low"].iloc[p3["start_idx"]], self.df["low"].iloc[p3["end_idx"]]]
-            hh = min(max(highs[j], highs[j + 1]) for j in range(0, 5, 2))
-            ll = max(min(lows[j], lows[j + 1]) for j in range(0, 5, 2))
+            pen_prices = [p1["start_price"], p1["end_price"], p2["start_price"],
+                          p2["end_price"], p3["start_price"], p3["end_price"]]
+            hh = min(max(pen_prices[j], pen_prices[j + 1]) for j in range(0, 5, 2))
+            ll = max(min(pen_prices[j], pen_prices[j + 1]) for j in range(0, 5, 2))
             if hh > ll:
-                self.centers.append({
-                    "start_idx": int(start_idx),
-                    "end_idx": int(end_idx),
-                    "high": round(float(hh), 2),
-                    "low": round(float(ll), 2),
-                })
+                if not self.centers or start_idx > self.centers[-1]["end_idx"]:
+                    self.centers.append({
+                        "start_idx": int(start_idx),
+                        "end_idx": int(end_idx),
+                        "high": round(float(hh), 2),
+                        "low": round(float(ll), 2),
+                    })
 
     def find_divergence(self):
-        """简单背驰检测：价格新低但 MACD hist 未新低。"""
+        """MACD柱面积背驰检测（面积缩小>20%判定）。"""
         if len(self.pens) < 2 or "hist" not in self.df.columns:
             return
         for i in range(len(self.pens) - 1):
             p1, p2 = self.pens[i], self.pens[i + 1]
-            if p1["direction"] != p2["direction"]:
+            if p1["direction"] == p2["direction"]:
+                continue
+            s1, e1 = min(p1["start_idx"], p1["end_idx"]), max(p1["start_idx"], p1["end_idx"])
+            s2, e2 = min(p2["start_idx"], p2["end_idx"]), max(p2["start_idx"], p2["end_idx"])
+            area1 = float(abs(self.df["hist"].iloc[s1:e1 + 1]).sum())
+            area2 = float(abs(self.df["hist"].iloc[s2:e2 + 1]).sum())
+            if area1 == 0:
                 continue
             if p2["direction"] == "down":
-                price1, price2 = p1["end_price"], p2["end_price"]
-                hist1 = self.df["hist"].iloc[p1["end_idx"]]
-                hist2 = self.df["hist"].iloc[p2["end_idx"]]
-                if price2 < price1 and hist2 > hist1:
+                price1, price2 = p1["start_price"], p2["end_price"]
+                if price2 < price1 and area2 < 0.8 * area1:
                     self.divergences.append({
                         "idx": int(p2["end_idx"]),
                         "type": "\u5e95\u80cc\u9a70",
                         "price": round(float(price2), 2),
-                        "note": "价格创新低，MACD未创新低，可能见底",
+                        "confidence": round(1 - area2 / area1, 2),
+                        "note": "MACD面积缩小{:.0f}%，价格创新低，可能见底".format((1 - area2 / area1) * 100),
                     })
             else:
-                price1, price2 = p1["end_price"], p2["end_price"]
-                hist1 = self.df["hist"].iloc[p1["end_idx"]]
-                hist2 = self.df["hist"].iloc[p2["end_idx"]]
-                if price2 > price1 and hist2 < hist1:
+                price1, price2 = p1["start_price"], p2["end_price"]
+                if price2 > price1 and area2 < 0.8 * area1:
                     self.divergences.append({
                         "idx": int(p2["end_idx"]),
                         "type": "\u9876\u80cc\u9a70",
                         "price": round(float(price2), 2),
-                        "note": "价格创新高，MACD未创新高，可能见顶",
+                        "confidence": round(1 - area2 / area1, 2),
+                        "note": "MACD面积缩小{:.0f}%，价格创新高，可能见顶".format((1 - area2 / area1) * 100),
                     })
+
+    def find_buy_sell_points(self):
+        """识别三类买卖点。"""
+        if not self.centers or not self.pens:
+            return
+        last_center = self.centers[-1]
+        last_price = float(self.df["close"].iloc[-1])
+        for div in self.divergences:
+            if div["type"] == "\u5e95\u80cc\u9a70" and div["idx"] >= len(self.df) - 10:
+                self.buy_sell_points.append({
+                    "type": "\u7b2c\u4e00\u7c7b\u4e70\u70b9",
+                    "idx": div["idx"],
+                    "price": div["price"],
+                    "reason": "\u4e0b\u8dcc\u8d8b\u52bf\u5e95\u80cc\u9a70\uff0c\u8f6c\u6298\u786e\u8ba4",
+                })
+                break
+            if div["type"] == "\u9876\u80cc\u9a70" and div["idx"] >= len(self.df) - 10:
+                self.buy_sell_points.append({
+                    "type": "\u7b2c\u4e00\u7c7b\u5356\u70b9",
+                    "idx": div["idx"],
+                    "price": div["price"],
+                    "reason": "\u4e0a\u6da8\u8d8b\u52bf\u9876\u80cc\u9a70\uff0c\u8f6c\u6298\u786e\u8ba4",
+                })
+                break
+        if len(self.pens) >= 2:
+            last_pen = self.pens[-1]
+            if last_pen["direction"] == "up":
+                retrace_low = last_pen["start_price"]
+                if retrace_low > last_center["low"] and retrace_low >= len(self.df) - 15:
+                    self.buy_sell_points.append({
+                        "type": "\u7b2c\u4e8c\u7c7b\u4e70\u70b9",
+                        "price": round(retrace_low, 2),
+                        "reason": "\u7b2c\u4e00\u7c7b\u4e70\u70b9\u540e\u56de\u62bd\u4e0d\u7834\u4e2d\u67a2\u4f4e\u70b9",
+                    })
+            if last_pen["direction"] == "down":
+                retrace_high = last_pen["start_price"]
+                if retrace_high < last_center["high"] and retrace_high >= len(self.df) - 15:
+                    self.buy_sell_points.append({
+                        "type": "\u7b2c\u4e8c\u7c7b\u5356\u70b9",
+                        "price": round(retrace_high, 2),
+                        "reason": "\u7b2c\u4e00\u7c7b\u5356\u70b9\u540e\u56de\u62bd\u4e0d\u7834\u4e2d\u67a2\u9ad8\u70b9",
+                    })
+        if last_price > last_center["high"]:
+            recent_low = float(self.df["low"].tail(5).min())
+            if recent_low > last_center["high"]:
+                self.buy_sell_points.append({
+                    "type": "\u7b2c\u4e09\u7c7b\u4e70\u70b9",
+                    "price": round(recent_low, 2),
+                    "reason": "\u7a81\u7834\u4e2d\u67a2\u540e\u56de\u62bd\u4e0d\u8fdb\u5165\u4e2d\u67a2\u533a\u95f4",
+                })
+        elif last_price < last_center["low"]:
+            recent_high = float(self.df["high"].tail(5).max())
+            if recent_high < last_center["low"]:
+                self.buy_sell_points.append({
+                    "type": "\u7b2c\u4e09\u7c7b\u5356\u70b9",
+                    "price": round(recent_high, 2),
+                    "reason": "\u8dcc\u7834\u4e2d\u67a2\u540e\u53cd\u5f39\u4e0d\u8fdb\u5165\u4e2d\u67a2\u533a\u95f4",
+                })
 
     def analyze(self):
         self.find_fractals()
         self.find_pens()
+        self.find_segments()
         self.find_centers()
         self.find_divergence()
+        self.find_buy_sell_points()
         return {
             "top_fractals": self.top_fractals,
             "bottom_fractals": self.bottom_fractals,
             "pens": self.pens,
+            "segments": self.segments,
             "centers": self.centers,
             "divergences": self.divergences,
+            "buy_sell_points": self.buy_sell_points,
             "trend": self._trend(),
         }
 
     def _trend(self):
-        if not self.pens:
-            return "\u5206\u578b\u4e0d\u8db3\uff0c\u65e0\u6cd5\u5224\u65ad"
-        last = self.pens[-1]
-        if last["direction"] == "up":
-            return "\u4e0a\u6da8\u8d8b\u52bf\uff08\u6700\u540e\u4e00\u7b14\u5411\u4e0a\uff09"
-        return "\u4e0b\u8dcc\u8d8b\u52bf\uff08\u6700\u540e\u4e00\u7b14\u5411\u4e0b\uff09"
+        if not self.centers:
+            if not self.pens:
+                return "\u5206\u578b\u4e0d\u8db3\uff0c\u65e0\u6cd5\u5224\u65ad"
+            last = self.pens[-1]
+            return "\u4e0a\u6da8\u8d8b\u52bf\uff08\u6700\u540e\u4e00\u7b14\u5411\u4e0a\uff09" if last["direction"] == "up" else "\u4e0b\u8dcc\u8d8b\u52bf\uff08\u6700\u540e\u4e00\u7b14\u5411\u4e0b\uff09"
+        if len(self.centers) >= 2:
+            c1, c2 = self.centers[-2], self.centers[-1]
+            if c2["high"] > c1["high"] and c2["low"] > c1["low"]:
+                return "\u4e0a\u6da8\u8d8b\u52bf\uff08\u4e2d\u67a2\u9010\u6b65\u62ac\u9ad8\uff09"
+            if c2["high"] < c1["high"] and c2["low"] < c1["low"]:
+                return "\u4e0b\u8dcc\u8d8b\u52bf\uff08\u4e2d\u67a2\u9010\u6b65\u4e0b\u964d\uff09"
+            return "\u76d8\u6574\u8d8b\u52bf\uff08\u4e2d\u67a2\u6a2a\u5411\u79fb\u52a8\uff09"
+        last = self.pens[-1] if self.pens else None
+        if last:
+            return "\u4e0a\u6da8\u8d8b\u52bf" if last["direction"] == "up" else "\u4e0b\u8dcc\u8d8b\u52bf"
+        return "\u6570\u636e\u4e0d\u8db3"
 
 
 # =============================================================================
@@ -1280,6 +1519,243 @@ class ThreeGearsAnalyzer:
 
 
 # =============================================================================
+# 4.7 头肩底形态识别器
+# =============================================================================
+
+class HeadAndShouldersBottom:
+    """头肩底（Inverse Head and Shoulders）形态识别器。
+
+    识别逻辑：
+    1. 在下跌趋势末期寻找三个连续的低点（左肩、头、右肩）
+    2. 头部最低，两肩高度相近（差异<15%）
+    3. 两肩之间的反弹高点构成颈线
+    4. 当前价格接近或突破颈线时触发信号
+    """
+
+    def __init__(self, df: pd.DataFrame):
+        self.df = df.copy().reset_index(drop=True)
+        self.patterns = []
+
+    def _find_swing_lows(self, order=3):
+        """找摆动低点。"""
+        lows = self.df["low"].values
+        n = len(lows)
+        swing_lows = []
+        for i in range(order, n - order):
+            if all(lows[i] <= lows[i - j] for j in range(1, order + 1)) and \
+               all(lows[i] <= lows[i + j] for j in range(1, order + 1)):
+                swing_lows.append((i, float(lows[i])))
+        return swing_lows
+
+    def _find_swing_highs(self, order=3):
+        """找摆动高点。"""
+        highs = self.df["high"].values
+        n = len(highs)
+        swing_highs = []
+        for i in range(order, n - order):
+            if all(highs[i] >= highs[i - j] for j in range(1, order + 1)) and \
+               all(highs[i] >= highs[i + j] for j in range(1, order + 1)):
+                swing_highs.append((i, float(highs[i])))
+        return swing_highs
+
+    def detect(self, min_lookback=30, max_lookback=200):
+        """检测头肩底形态。"""
+        df = self.df
+        n = len(df)
+        start = max(0, n - max_lookback)
+        end = n
+        df_range = df.iloc[start:end].reset_index(drop=True)
+
+        swing_lows = self._find_swing_lows(order=3)
+        swing_highs = self._find_swing_highs(order=3)
+
+        swing_lows = [(i, p) for i, p in swing_lows if start <= i < end]
+        swing_highs = [(i, p) for i, p in swing_highs if start <= i < end]
+
+        if len(swing_lows) < 3 or len(swing_highs) < 2:
+            return self.patterns
+
+        for head_idx in range(1, len(swing_lows) - 1):
+            head_i, head_price = swing_lows[head_idx]
+            left_i, left_price = swing_lows[head_idx - 1]
+            right_i, right_price = swing_lows[head_idx + 1]
+
+            if head_i - left_i < 3 or right_i - head_i < 3:
+                continue
+
+            if not (head_price < left_price and head_price < right_price):
+                continue
+
+            shoulder_diff = abs(left_price - right_price) / min(left_price, right_price)
+            if shoulder_diff > 0.15:
+                continue
+
+            neckline_highs = [(i, p) for i, p in swing_highs
+                              if left_i < i < right_i and p > head_price]
+            if len(neckline_highs) < 2:
+                continue
+
+            neckline_highs.sort(key=lambda x: x[0])
+            neck_p1 = neckline_highs[0]
+            neck_p2 = neckline_highs[-1]
+            neckline_price = (neck_p1[1] + neck_p2[1]) / 2.0
+
+            head_depth = (neckline_price - head_price) / neckline_price
+            if head_depth < 0.03:
+                continue
+
+            current_price = float(df["close"].iloc[-1])
+            distance_to_neck = (current_price - neckline_price) / neckline_price
+
+            if distance_to_neck > 0.10:
+                continue
+
+            if distance_to_neck > 0:
+                signal = "突破颈线，头肩底确认"
+                action = "买入信号"
+            elif distance_to_neck > -0.03:
+                signal = "接近颈线，即将突破"
+                action = "关注突破"
+            else:
+                signal = "头肩底形态形成中"
+                action = "等待突破确认"
+
+            volume_left = float(df["volume"].iloc[left_i]) if "volume" in df.columns else 0
+            volume_head = float(df["volume"].iloc[head_i]) if "volume" in df.columns else 0
+            volume_right = float(df["volume"].iloc[right_i]) if "volume" in df.columns else 0
+            vol_pattern = ""
+            if volume_head > 0 and volume_left > 0 and volume_right > 0:
+                if volume_left > volume_head and volume_right > volume_head:
+                    vol_pattern = "缩量筑底（左肩和右肩量能大于头部，理想形态）"
+                elif volume_right > volume_left:
+                    vol_pattern = "右肩放量（突破动力较强）"
+                else:
+                    vol_pattern = "量能一般"
+
+            target_price = neckline_price + (neckline_price - head_price)
+
+            self.patterns.append({
+                "left_shoulder": {"idx": int(left_i), "price": round(left_price, 2),
+                                  "date": str(df["date"].iloc[left_i].date())},
+                "head": {"idx": int(head_i), "price": round(head_price, 2),
+                         "date": str(df["date"].iloc[head_i].date())},
+                "right_shoulder": {"idx": int(right_i), "price": round(right_price, 2),
+                                   "date": str(df["date"].iloc[right_i].date())},
+                "neckline": round(neckline_price, 2),
+                "neckline_points": [
+                    {"idx": int(neck_p1[0]), "price": round(neck_p1[1], 2)},
+                    {"idx": int(neck_p2[0]), "price": round(neck_p2[1], 2)},
+                ],
+                "head_depth": round(float(head_depth) * 100, 2),
+                "distance_to_neckline": round(float(distance_to_neck) * 100, 2),
+                "target_price": round(target_price, 2),
+                "signal": signal,
+                "action": action,
+                "volume_pattern": vol_pattern,
+                "current_price": round(current_price, 2),
+            })
+
+        self.patterns.sort(key=lambda x: abs(x["distance_to_neckline"]))
+        return self.patterns
+
+    def analyze(self):
+        self.detect()
+        best = self.patterns[0] if self.patterns else None
+        return {
+            "detected": len(self.patterns) > 0,
+            "pattern_count": len(self.patterns),
+            "best_pattern": best,
+            "all_patterns": self.patterns,
+        }
+
+
+# =============================================================================
+# 4.8 筹码交易信号分析
+# =============================================================================
+
+def analyze_cyq_signals(cyq_result, df):
+    """基于筹码分布指标生成交易信号。
+
+    信号规则：
+    1. 低位密集 + CYS<-20% -> 超卖+主力吸筹 -> 买入
+    2. 放量突破筹码密集区 -> 有效突破 -> 跟进
+    3. 高位密集 + CYS>30% -> 超买+主力派发 -> 卖出
+    4. 筹码快速下沉 -> 主力出货 -> 离场
+    """
+    signals = []
+    profit_ratio = cyq_result.get("profit_ratio", 0)
+    avg_cost = cyq_result.get("avg_cost", 0)
+    current_price = cyq_result.get("current_price", 0)
+    concentration = cyq_result.get("concentration", 0)
+    peak_price = cyq_result.get("peak_price", 0)
+    main_low = cyq_result.get("main_force_low", 0)
+    main_high = cyq_result.get("main_force_high", 0)
+
+    if current_price <= 0 or avg_cost <= 0:
+        return {"signals": [], "summary": "数据不足"}
+
+    cys = (current_price - avg_cost) / avg_cost
+    peak_position = (peak_price - current_price) / current_price
+    is_low_concentration = abs(peak_position) < 0.10 and concentration > 0.5
+    is_high_concentration = peak_price > current_price * 1.1 and concentration > 0.4
+
+    if is_low_concentration and cys < -0.20:
+        signals.append({
+            "type": "BUY",
+            "signal": "低位密集+超卖",
+            "detail": f"筹码集中于低位(峰值{peak_price:.2f})，CYS={cys*100:.1f}%，主力吸筹信号",
+        })
+    if is_high_concentration and cys > 0.30:
+        signals.append({
+            "type": "SELL",
+            "signal": "高位密集+超买",
+            "detail": f"筹码集中于高位(峰值{peak_price:.2f})，CYS={cys*100:.1f}%，主力派发信号",
+        })
+
+    if len(df) >= 10 and "volume" in df.columns:
+        recent_vol = float(df["volume"].tail(5).mean())
+        prev_vol = float(df["volume"].iloc[-10:-5].mean())
+        if prev_vol > 0:
+            vol_ratio = recent_vol / prev_vol
+            if vol_ratio > 1.5 and current_price > avg_cost * 1.02:
+                signals.append({
+                    "type": "FOLLOW",
+                    "signal": "放量突破筹码密集区",
+                    "detail": f"量比{vol_ratio:.1f}倍，价格突破平均成本{avg_cost:.2f}，有效突破",
+                })
+
+    if main_low > 0 and main_high > 0 and len(df) >= 20:
+        recent_main_low = main_low
+        older_idx = max(0, len(df) - 20)
+        peak_above_current = peak_price > current_price
+        if peak_above_current and peak_price < main_low:
+            signals.append({
+                "type": "EXIT",
+                "signal": "筹码快速下沉",
+                "detail": f"筹码峰值{peak_price:.2f}低于主力成本区下沿{main_low:.2f}，主力出货",
+            })
+
+    if not signals:
+        signals.append({
+            "type": "NEUTRAL",
+            "signal": "筹码信号中性",
+            "detail": f"获利盘{profit_ratio*100:.1f}%，集中度{concentration:.2%}，无明确信号",
+        })
+
+    summary_parts = [f"获利盘{profit_ratio*100:.1f}%", f"CYS={cys*100:.1f}%"]
+    if signals:
+        summary_parts.append(f"信号: {signals[0]['signal']}")
+
+    return {
+        "signals": signals,
+        "cys": round(cys * 100, 2),
+        "is_low_concentration": is_low_concentration,
+        "is_high_concentration": is_high_concentration,
+        "summary": " | ".join(summary_parts),
+    }
+
+
+# =============================================================================
 # 5. MACD / MA 分析
 # =============================================================================
 
@@ -1727,16 +2203,16 @@ def generate_infographic(df, report, output_path):
     sections = []
     chan = report.get("chanlun", {})
     if chan:
-        sections.append(("缠论分析", chan.get("trend", "未知")))
-    dow = report.get("dow", {})
-    if dow:
-        sections.append(("道氏趋势", f"{dow.get('primary_trend', '')} / {dow.get('secondary_trend', '')}"))
+        bs_points = chan.get("buy_sell_points", [])
+        bs_str = f" | {bs_points[0]['type']}" if bs_points else ""
+        sections.append(("缠论分析", f"{chan.get('trend', '未知')}{bs_str}"))
     tg = report.get("three_gears", {})
     if tg:
         sections.append(("三档战法", tg.get("current_position", "未知")))
-    macd = report.get("macd", {})
-    if macd:
-        sections.append(("MACD", f"DIF={macd.get('dif', 0):.3f} DEA={macd.get('dea', 0):.3f} {macd.get('trend', '')}"))
+    hs = report.get("head_shoulders_bottom", {})
+    if hs and hs.get("detected") and hs.get("best_pattern"):
+        bp = hs["best_pattern"]
+        sections.append(("头肩底", f"{bp['signal']} 目标{bp['target_price']:.2f}"))
     ma = report.get("ma", {})
     if ma:
         latest_ma = ma.get("latest", {})
@@ -1744,24 +2220,31 @@ def generate_infographic(df, report, output_path):
         sections.append(("均线", f"{ma_str} ({ma.get('arrangement', '')})"))
     cyq = report.get("cyq", {})
     if cyq:
-        sections.append(("筹码", f"获利盘 {cyq.get('profit_ratio', 0)*100:.1f}% 峰值 {cyq.get('peak_price', 0):.2f}"))
+        cyq_sig = cyq.get("signals", {}).get("signals", [])
+        sig_str = cyq_sig[0]["signal"] if cyq_sig else ""
+        sections.append(("筹码", f"获利盘{cyq.get('profit_ratio', 0)*100:.1f}% {sig_str}"))
     ff = report.get("fund_flow", {})
     if ff:
         main_in = ff.get("main_net_inflow")
         if main_in is not None:
             direction = "流入" if main_in >= 0 else "流出"
             sections.append(("资金流向", f"主力净{direction} {abs(main_in)/1e8:.2f}亿"))
-    fund = report.get("fundamentals", {})
-    if fund:
+    fund_data = report.get("fundamentals", {})
+    if fund_data:
         parts = []
-        if fund.get("revenue_yoy") is not None:
-            parts.append(f"营收同比{fund['revenue_yoy']*100:+.1f}%")
-        if fund.get("roe") is not None:
-            parts.append(f"ROE {fund['roe']:.1f}%")
-        if fund.get("gross_margin") is not None:
-            parts.append(f"毛利率 {fund['gross_margin']:.1f}%")
-        if fund.get("eps") is not None:
-            parts.append(f"EPS {fund['eps']:.2f}")
+        income = fund_data.get("income", {})
+        if income.get("revenue_yoy") is not None:
+            parts.append(f"营收同比{income['revenue_yoy']*100:+.1f}%")
+        if income.get("roe") is not None:
+            parts.append(f"ROE {income['roe']:.1f}%")
+        if income.get("eps") is not None:
+            parts.append(f"EPS {income['eps']:.2f}")
+        bs = fund_data.get("balance_sheet", {})
+        if bs.get("debt_ratio") is not None:
+            parts.append(f"负债率{bs['debt_ratio']*100:.1f}%")
+        cf = fund_data.get("cashflow", {})
+        if cf.get("operating_cash_flow") is not None:
+            parts.append(f"经营现金流{cf['operating_cash_flow']/1e8:.1f}亿")
         if parts:
             sections.append(("基本面", " | ".join(parts)))
 
@@ -1901,31 +2384,58 @@ def upload_to_cos(local_path, remote_dir="h5-chart"):
 # 8. 报告构建
 # =============================================================================
 
-def build_report(df, chan_result, dow_result, macd_result, ma_result, cyq_result, three_gears_result, name, symbol, code, market, fund_flow=None, fundamentals=None):
-    """构建 JSON 报告。"""
+def build_report(df, chan_result, ma_result, cyq_result, cyq_signals, three_gears_result,
+                 head_shoulders_result, name, symbol, code, market,
+                 fund_flow=None, fundamentals=None, balance_sheet=None, cashflow=None):
+    """构建 JSON 报告。六大模块：均线 + 头肩底 + 缠论 + 筹码 + 三档 + 基本面。"""
     latest = df.iloc[-1]
     prev = df.iloc[-2] if len(df) > 1 else latest
     current_price = float(latest["close"])
     prev_close = float(prev["close"])
     change_pct = float((current_price / prev_close - 1) * 100) if prev_close > 0 else 0.0
 
-    # 综合建议
     recommendations = []
-    tg_recs = three_gears_result.get("recommendation", [])
+
+    # 三档战法建议（最高优先级）
+    tg = three_gears_result
+    tg_recs = tg.get("recommendation", [])
     if tg_recs:
         recommendations.extend(tg_recs[:3])
-    if macd_result.get("last_cross"):
-        cross = macd_result["last_cross"]
-        recommendations.append(f"MACD 最近{cross['type']} ({cross['date']})")
+    position = tg.get("current_position", "")
+    if "一档" in position and "第三点" in position:
+        recommendations.insert(0, "一档线第三点介入区，长线建仓")
+    elif "二档" in position and "第三点" in position:
+        recommendations.insert(0, "二档线第三点介入区，中线加仓")
+    elif "三档" in position and "第三点" in position:
+        recommendations.insert(0, "三档线第三点介入区，短线追涨（注意风险）")
+
+    # 头肩底建议
+    hs = head_shoulders_result
+    if hs.get("detected") and hs.get("best_pattern"):
+        bp = hs["best_pattern"]
+        recommendations.insert(0, f"头肩底: {bp['signal']}，目标价 {bp['target_price']:.2f}")
+
+    # 缠论建议
+    if chan_result.get("buy_sell_points"):
+        for pt in chan_result["buy_sell_points"][:2]:
+            recommendations.append(f"缠论{pt['type']}: {pt['reason']}")
+    if chan_result.get("divergences"):
+        for div in chan_result["divergences"][-1:]:
+            recommendations.append(f"缠论{div['type']}: {div.get('note', '')}")
+
+    # 均线建议
     if ma_result.get("arrangement") == "多头排列":
         recommendations.append("均线多头排列，趋势向好")
     elif ma_result.get("arrangement") == "空头排列":
         recommendations.append("均线空头排列，趋势偏弱")
-    if chan_result.get("divergences"):
-        for div in chan_result["divergences"][-1:]:
-            recommendations.append(f"缠论{div['type']}信号: {div.get('note', '')}")
 
-    # 国信资金流向建议
+    # 筹码信号建议
+    if cyq_signals.get("signals"):
+        for sig in cyq_signals["signals"]:
+            if sig["type"] in ("BUY", "SELL", "EXIT"):
+                recommendations.append(f"筹码{sig['signal']}: {sig['detail']}")
+
+    # 资金流向建议
     ff = fund_flow or {}
     if ff.get("main_net_inflow") is not None:
         inflow = ff["main_net_inflow"]
@@ -1934,7 +2444,7 @@ def build_report(df, chan_result, dow_result, macd_result, ma_result, cyq_result
         elif inflow < 0:
             recommendations.append(f"主力资金净流出 {abs(inflow)/1e8:.2f}亿，资金面偏空")
 
-    # 国信基本面建议
+    # 基本面建议
     fund = fundamentals or {}
     if fund.get("revenue_yoy") is not None:
         if fund["revenue_yoy"] > 0.1:
@@ -1944,18 +2454,17 @@ def build_report(df, chan_result, dow_result, macd_result, ma_result, cyq_result
     if fund.get("roe") is not None and fund["roe"] > 15:
         recommendations.append(f"ROE {fund['roe']:.1f}%，盈利能力较强")
 
+    bs = balance_sheet or {}
+    if bs.get("debt_ratio") is not None:
+        if bs["debt_ratio"] > 0.7:
+            recommendations.append(f"资产负债率 {bs['debt_ratio']*100:.1f}%，负债偏高")
+
+    cf = cashflow or {}
+    if cf.get("operating_cash_flow") is not None and cf["operating_cash_flow"] < 0:
+        recommendations.append(f"经营现金流为负 ({cf['operating_cash_flow']/1e8:.2f}亿)，关注现金流风险")
+
     if not recommendations:
         recommendations.append("当前无明确信号，观望为主")
-
-    # 三档战法位置建议
-    tg = three_gears_result
-    position = tg.get("current_position", "")
-    if "一档" in position and "第三点" in position:
-        recommendations.insert(0, "一档线第三点介入区，长线建仓")
-    elif "二档" in position and "第三点" in position:
-        recommendations.insert(0, "二档线第三点介入区，中线加仓")
-    elif "三档" in position and "第三点" in position:
-        recommendations.insert(0, "三档线第三点介入区，短线追涨（注意风险）")
 
     report = {
         "meta": {
@@ -1981,21 +2490,15 @@ def build_report(df, chan_result, dow_result, macd_result, ma_result, cyq_result
             "top_fractals_count": len(chan_result.get("top_fractals", [])),
             "bottom_fractals_count": len(chan_result.get("bottom_fractals", [])),
             "pens_count": len(chan_result.get("pens", [])),
+            "segments_count": len(chan_result.get("segments", [])),
             "centers_count": len(chan_result.get("centers", [])),
             "divergences": chan_result.get("divergences", []),
+            "buy_sell_points": chan_result.get("buy_sell_points", []),
             "bottom_fractals": chan_result.get("bottom_fractals", []),
             "trend": chan_result.get("trend", "未知"),
         },
-        "dow": {
-            "primary_trend": dow_result.get("primary_trend", "未知"),
-            "secondary_trend": dow_result.get("secondary_trend", "未知"),
-            "volume_trend": dow_result.get("volume_trend", "未知"),
-            "volume_change": dow_result.get("volume_change", 0),
-            "recent_high": dow_result.get("recent_high", 0),
-            "recent_low": dow_result.get("recent_low", 0),
-            "supports": dow_result.get("supports", []),
-            "resistances": dow_result.get("resistances", []),
-        },
+        "ma": ma_result,
+        "head_shoulders_bottom": hs,
         "three_gears": {
             "up_gears": three_gears_result.get("up_gears", {}),
             "down_gears": three_gears_result.get("down_gears", {}),
@@ -2004,11 +2507,7 @@ def build_report(df, chan_result, dow_result, macd_result, ma_result, cyq_result
             "current_point": three_gears_result.get("current_point", 0),
             "recommendation": three_gears_result.get("recommendation", []),
         },
-        "macd": macd_result,
-        "ma": ma_result,
         "cyq": {
-            "price_bins": [round(v, 2) for v in (cyq_result.get("price_bins") or [])],
-            "chip_distribution": [round(v, 6) for v in (cyq_result.get("chip_distribution") or [])],
             "current_price": cyq_result.get("current_price", current_price),
             "profit_ratio": round(cyq_result.get("profit_ratio", 0), 4),
             "avg_cost": round(cyq_result.get("avg_cost", current_price), 2),
@@ -2018,9 +2517,15 @@ def build_report(df, chan_result, dow_result, macd_result, ma_result, cyq_result
             "main_force_high": round(cyq_result.get("main_force_high", current_price), 2),
             "price_low_90": round(cyq_result.get("price_low_90", current_price), 2),
             "price_high_90": round(cyq_result.get("price_high_90", current_price), 2),
+            "signals": cyq_signals,
+            "source": cyq_result.get("source", "local"),
         },
-        "fund_flow": fund_flow or {},
-        "fundamentals": fundamentals or {},
+        "fundamentals": {
+            "income": fund,
+            "balance_sheet": bs,
+            "cashflow": cf,
+        },
+        "fund_flow": ff,
         "recommendation": recommendations,
     }
     return report
@@ -2033,98 +2538,119 @@ def build_report(df, chan_result, dow_result, macd_result, ma_result, cyq_result
 def main():
     args = parse_args()
 
-    # 设置字体
     setup_chinese_font()
 
-    # 始终拉取全量历史数据（筹码/道氏需要）
     df, code, market = fetch_data(args.symbol, args.days, full_history=True)
     _, _, is_index = normalize_symbol(args.symbol)
     print(f"[main] 全量数据: {len(df)} 根K线, {df['date'].iloc[0].date()} ~ {df['date'].iloc[-1].date()}")
 
-    # 全量数据计算 MACD/MA（道氏图/筹码图展示用）
     df_full = df.copy()
     df_full = calc_macd(df_full)
     df_full = calc_ma(df_full, periods=(5, 10, 20))
 
-    # 切出可见范围（用于缠论分析 + 缠论图/信息图渲染）
     df_visible = df.tail(args.days).reset_index(drop=True)
-    print(f"[main] 可见范围: {len(df_visible)} 根K线 ({args.days}天), {df_visible['date'].iloc[0].date()} ~ {df_visible['date'].iloc[-1].date()}")
+    print(f"[main] 可见范围: {len(df_visible)} 根K线 ({args.days}天)")
 
-    # 计算指标（用可见范围数据）
     df_visible = calc_macd(df_visible)
     df_visible = calc_ma(df_visible, periods=(5, 10, 20))
 
-    # 各种分析
-    print("[main] 缠论分析（使用可见范围）...")
+    # === 六大模块分析 ===
+
+    # 1. 缠论分析
+    print("[main] 缠论分析...")
     chan = ChanLunAnalyzer(df_visible)
     chan_result = chan.analyze()
 
-    dow_result = {}  # 基础道氏分析已废弃，只保留三档战法
-
-    print("[main] 道氏三档分析（使用全量数据）...")
-    tg = ThreeGearsAnalyzer(df, lookback=args.days)
-    three_gears_result = tg.analyze()
-
-    print("[main] MACD分析（使用可见范围）...")
+    # 2. 均线分析
+    print("[main] 均线分析...")
+    ma_result = analyze_ma_arrangement(df_visible)
     macd_result = analyze_macd_cross(df_visible)
 
-    print("[main] MA分析（使用可见范围）...")
-    ma_result = analyze_ma_arrangement(df_visible)
+    # 3. 头肩底识别
+    print("[main] 头肩底形态识别...")
+    hs_detector = HeadAndShouldersBottom(df_visible)
+    head_shoulders_result = hs_detector.analyze()
+    if head_shoulders_result["detected"]:
+        print(f"[main] 发现 {head_shoulders_result['pattern_count']} 个头肩底形态")
 
+    # 4. 筹码分析
     print("[main] 筹码分布分析...")
-    # 1) 优先用 WeStock chip 命令获取腾讯真实指标
     cyq_external = None
     full_symbol = market + code
     try:
         cyq_external = fetch_cyq_westock(full_symbol)
         if cyq_external:
-            print(f"[main] WeStock 筹码指标: 获利盘 {cyq_external['profit_ratio']*100:.1f}%, 平均成本 {cyq_external['avg_cost']:.2f}")
+            print(f"[main] WeStock 筹码: 获利盘 {cyq_external['profit_ratio']*100:.1f}%, 平均成本 {cyq_external['avg_cost']:.2f}")
     except Exception as e:
         print(f"[main] WeStock 筹码接口失败: {e}")
 
-    # 2) 本地计算用于图表分布数据（price_bins, chip_distribution, peak_price）
     cyq_local = calculate_cyq(df)
     if cyq_local is None:
         cyq_local = {}
-
-    # 3) 合并：WeStock 指标优先，本地补充图表数据
     if cyq_external:
         cyq_result = {**cyq_local, **cyq_external}
         cyq_result["source"] = "westock"
     else:
         cyq_result = cyq_local
         cyq_result["source"] = "local"
-    print(f"[main] 筹码数据来源: {cyq_result.get('source')}")
 
-    # 国信证券数据（资金流向 + 财务基本面）
+    cyq_signals = analyze_cyq_signals(cyq_result, df_visible)
+    print(f"[main] 筹码信号: {cyq_signals['summary']}")
+
+    # 5. 三档战法
+    print("[main] 三档战法分析...")
+    tg = ThreeGearsAnalyzer(df, lookback=args.days)
+    three_gears_result = tg.analyze()
+
+    # 6. 基本面分析
     gs_set_code = 1 if market == "sh" else 0
     gs_market = "SH" if market == "sh" else "SZ"
 
     fund_flow_result = {}
-    try:
-        if not is_index:
+    financial_result = {}
+    balance_result = {}
+    cashflow_result = {}
+
+    if not is_index:
+        try:
             fund_flow_result = fetch_gs_fund_flow(code, gs_set_code, period=10)
             if fund_flow_result:
-                print(f"[main] 国信资金流向: 主力净流入 {fund_flow_result.get('main_net_inflow', 'N/A')}")
-    except Exception as e:
-        print(f"[main] 国信资金流向失败: {e}")
+                print(f"[main] 资金流向: 主力净流入 {fund_flow_result.get('main_net_inflow', 'N/A')}")
+        except Exception as e:
+            print(f"[main] 资金流向失败: {e}")
 
-    financial_result = {}
-    try:
-        if not is_index:
+        try:
             financial_result = fetch_gs_financials(code, gs_market)
             if financial_result:
-                print(f"[main] 国信财务数据: 营收 {financial_result.get('revenue', 'N/A')}, ROE {financial_result.get('roe', 'N/A')}")
-    except Exception as e:
-        print(f"[main] 国信财务数据失败: {e}")
+                print(f"[main] 利润表: 营收 {financial_result.get('revenue', 'N/A')}, ROE {financial_result.get('roe', 'N/A')}")
+        except Exception as e:
+            print(f"[main] 利润表失败: {e}")
 
-    # 构建报告（用 df_visible 做基础数据）
-    report = build_report(df_visible, chan_result, dow_result, macd_result, ma_result, cyq_result, three_gears_result, args.name, args.symbol, code, market, fund_flow=fund_flow_result, fundamentals=financial_result)
+        try:
+            balance_result = fetch_gs_balance_sheet(code, gs_market)
+            if balance_result:
+                print(f"[main] 资产负债表: 负债率 {balance_result.get('debt_ratio', 'N/A')}")
+        except Exception as e:
+            print(f"[main] 资产负债表失败: {e}")
+
+        try:
+            cashflow_result = fetch_gs_cashflow(code, gs_market)
+            if cashflow_result:
+                print(f"[main] 现金流: 经营现金流 {cashflow_result.get('operating_cash_flow', 'N/A')}")
+        except Exception as e:
+            print(f"[main] 现金流失败: {e}")
+
+    report = build_report(
+        df_visible, chan_result, ma_result, cyq_result, cyq_signals,
+        three_gears_result, head_shoulders_result,
+        args.name, args.symbol, code, market,
+        fund_flow=fund_flow_result, fundamentals=financial_result,
+        balance_sheet=balance_result, cashflow=cashflow_result,
+    )
     print("\n" + "=" * 60)
     print(json.dumps(report, ensure_ascii=False, indent=2))
     print("=" * 60 + "\n")
 
-    # 生成图表
     paths = {}
     urls = {}
     if not args.no_charts:
@@ -2132,7 +2658,7 @@ def main():
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         prefix = f"{market}{code}"
 
-        # 道氏图（三档线，使用全量K线）
+        # 三档图（使用全量K线）
         dow_path = os.path.join(args.output_dir, f"dow_{prefix}_{ts}.png")
         generate_dow_chart(df_full, report, args.name, dow_path)
         paths["dow"] = dow_path
@@ -2153,7 +2679,6 @@ def main():
         if info_path and os.path.exists(info_path):
             paths["infographic"] = info_path
 
-        # COS 上传
         if args.upload:
             for key, path in paths.items():
                 if os.path.exists(path):

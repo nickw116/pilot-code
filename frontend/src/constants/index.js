@@ -25,6 +25,7 @@ export const API_CHANGE_PASSWORD = '/change-password'
 export const API_MODELS = '/models'
 export const API_MODEL_SWITCH = '/model/switch'
 export const API_AGENTS = '/agents'
+export const API_STT = '/stt'
 
 // Session
 export const SESSION_PREFIX = 'agent:main:h5'

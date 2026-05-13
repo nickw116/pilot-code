@@ -350,6 +350,72 @@ app.post("/api/upload", auth, upload.single("file"), (req, res) => {
   res.json(result);
 });
 
+app.post("/api/stt", auth, upload.single("audio"), async (req, res) => {
+  const file = req.file as Express.Multer.File | undefined;
+  if (!file) {
+    return res.status(400).json({ detail: "No audio file provided" });
+  }
+
+  try {
+    const { execFile } = await import("child_process");
+    const wavPath = file.path + ".wav";
+
+    await new Promise<void>((resolve, reject) => {
+      execFile("ffmpeg", ["-y", "-i", file.path, "-ar", "16000", "-ac", "1", wavPath], (err) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+
+    const audioBuffer = fs.readFileSync(wavPath);
+    const base64Audio = audioBuffer.toString("base64");
+    if (fs.existsSync(wavPath)) fs.unlinkSync(wavPath);
+    if (fs.existsSync(file.path)) fs.unlinkSync(file.path);
+
+    const apiKey = process.env.XIAOMI_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({ detail: "STT service not configured" });
+    }
+
+    const sttResp = await fetch("https://token-plan-cn.xiaomimimo.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: "mimo-v2-omni",
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "请将这段语音转录为纯文字，只输出转录结果，不要加任何说明。" },
+              { type: "input_audio", input_audio: { data: base64Audio, format: "wav" } },
+            ],
+          },
+        ],
+        stream: false,
+        max_tokens: 2048,
+      }),
+    });
+
+    if (!sttResp.ok) {
+      const errText = await sttResp.text();
+      console.error("[stt] upstream error:", sttResp.status, errText);
+      return res.status(502).json({ detail: "语音识别服务异常" });
+    }
+
+    const data = await sttResp.json();
+    let text = data.choices?.[0]?.message?.content?.trim() || "";
+    text = text.replace(/^["「『]|["」』]$/g, "").trim();
+    res.json({ text });
+  } catch (err: any) {
+    console.error("[stt] error:", err?.message || err);
+    if (file.path && fs.existsSync(file.path)) fs.unlinkSync(file.path);
+    res.status(500).json({ detail: "语音识别失败" });
+  }
+});
+
 app.get("/api/download", auth, (req, res) => {
   const filePath = req.query.path as string;
   const url = req.query.url as string;

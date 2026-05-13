@@ -30,10 +30,28 @@
           <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
         </svg>
       </van-button>
+      <van-button
+        size="small"
+        :class="['voice-btn', { 'voice-btn--active': voiceRecording, 'voice-btn--processing': voiceProcessing }]"
+        @click="toggleVoice"
+        :disabled="loading || voiceProcessing"
+        :title="voiceRecording ? '点击停止录音' : (voiceProcessing ? '正在识别...' : '语音输入')"
+      >
+        <svg v-if="!voiceProcessing" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+          <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+          <line x1="12" y1="19" x2="12" y2="23"/>
+          <line x1="8" y1="23" x2="16" y2="23"/>
+        </svg>
+        <svg v-else width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="voice-spin">
+          <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
+        </svg>
+        <span v-if="voiceRecording" class="voice-dot"></span>
+      </van-button>
       <div class="input-wrapper">
         <van-field
           :model-value="modelValue"
-          :placeholder="uploading ? `上传中 ${uploadProgress}%...` : (attachments.length ? '添加文字说明（可选）...' : '输入消息，可粘贴图片...')"
+          :placeholder="voiceProcessing ? '正在识别语音...' : (uploading ? `上传中 ${uploadProgress}%...` : (attachments.length ? '添加文字说明（可选）...' : '输入消息，可粘贴图片...'))"
           :border="false"
           type="textarea"
           rows="1"
@@ -73,8 +91,9 @@
 </template>
 
 <script setup>
-import { ref } from 'vue'
-import { showImagePreview } from 'vant'
+import { ref, onUnmounted } from 'vue'
+import { showImagePreview, showNotify } from 'vant'
+import { API_BASE, TOKEN_KEY } from '../constants/index.js'
 
 const props = defineProps({
   modelValue: { type: String, default: '' },
@@ -93,6 +112,95 @@ const emit = defineEmits([
 ])
 
 const fileInputRef = ref(null)
+const voiceRecording = ref(false)
+const voiceProcessing = ref(false)
+let mediaRecorder = null
+let audioChunks = []
+
+function toggleVoice() {
+  if (voiceProcessing.value) return
+  if (voiceRecording.value) {
+    stopVoice()
+    return
+  }
+  startVoice()
+}
+
+async function startVoice() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+    audioChunks = []
+    mediaRecorder = new MediaRecorder(stream)
+    mediaRecorder.ondataavailable = (e) => {
+      if (e.data.size > 0) audioChunks.push(e.data)
+    }
+    mediaRecorder.onstop = () => {
+      stream.getTracks().forEach(t => t.stop())
+      voiceRecording.value = false
+      if (audioChunks.length > 0) {
+        sendVoiceToServer()
+      }
+    }
+    mediaRecorder.start()
+    voiceRecording.value = true
+  } catch (e) {
+    console.warn('[voice] start failed:', e)
+    showNotify({ type: 'warning', message: '无法启动录音，请允许麦克风权限' })
+  }
+}
+
+function stopVoice() {
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+    mediaRecorder.stop()
+  }
+}
+
+async function sendVoiceToServer() {
+  const mimeType = audioChunks[0]?.type || 'audio/webm'
+  const blob = new Blob(audioChunks, { type: mimeType })
+  audioChunks = []
+
+  if (blob.size < 500) {
+    showNotify({ type: 'warning', message: '录音时间太短，请重试' })
+    return
+  }
+
+  voiceProcessing.value = true
+  try {
+    const formData = new FormData()
+    formData.append('audio', blob, `voice_${Date.now()}.webm`)
+
+    const token = localStorage.getItem(TOKEN_KEY)
+    const resp = await fetch(`${API_BASE}/stt`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+      body: formData,
+    })
+    if (!resp.ok) {
+      const err = await resp.text()
+      throw new Error(err || `HTTP ${resp.status}`)
+    }
+    const data = await resp.json()
+    const text = data.text || ''
+    if (text) {
+      const current = props.modelValue
+      emit('update:modelValue', current ? current + '\n' + text : text)
+    } else {
+      showNotify({ type: 'warning', message: '未能识别语音内容' })
+    }
+  } catch (e) {
+    console.error('[voice] stt failed:', e)
+    showNotify({ type: 'warning', message: '语音识别失败，请重试' })
+  } finally {
+    voiceProcessing.value = false
+  }
+}
+
+onUnmounted(() => {
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+    mediaRecorder.stop()
+  }
+})
 
 function previewAttachment(att) {
   const src = att.preview || att.url
@@ -184,6 +292,61 @@ function handleDrop(e) {
 .attach-btn.van-button--disabled {
   opacity: 0.5;
   color: #aaa;
+}
+
+/* ── Voice Button ── */
+.voice-btn {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  position: relative;
+}
+.voice-btn.van-button {
+  background: #E8E8E8;
+  border: none;
+  color: #8E8E8E;
+}
+.voice-btn:active { transform: scale(0.92); }
+.voice-btn.van-button--disabled {
+  opacity: 0.5;
+  color: #aaa;
+}
+.voice-btn--active.van-button {
+  background: #EF4444;
+  color: #FFFFFF;
+  animation: voice-pulse 1.2s ease-in-out infinite;
+}
+.voice-dot {
+  position: absolute;
+  bottom: 2px;
+  right: 2px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #EF4444;
+  animation: dot-blink 0.8s ease-in-out infinite;
+}
+@keyframes voice-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4); }
+  50% { box-shadow: 0 0 0 8px rgba(239, 68, 68, 0); }
+}
+@keyframes dot-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+.voice-btn--processing.van-button {
+  background: #007AFF;
+  color: #FFFFFF;
+}
+.voice-spin {
+  animation: voice-spin-anim 1s linear infinite;
+}
+@keyframes voice-spin-anim {
+  to { transform: rotate(360deg); }
 }
 
 /* ── Attachment Preview ── */

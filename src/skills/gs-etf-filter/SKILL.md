@@ -79,38 +79,18 @@ python /workspace/projects/gs-etf-filter/scripts/get_data.py --help
 2. 登录后获取您的API Key。登录位置：网页一级标题栏-登录。登录后，点击账号，在弹窗上可一键复制API Key。
 3. 在技能凭证配置中填入API Key
 
-### API Key持久化存储（重要）
+### API Key配置
 
-当用户提供API Key并完成凭证配置后，智能体**必须**执行以下操作：
+该技能依赖国信证券小信智慧助手的数据服务，需要先配置API Key。
 
-1. **立即写入memory.md**：
-   - 创建或更新 `./memory.md` 文件
-   - 添加以下内容：
-     ```markdown
-     ## 国信证券ETF筛选服务配置
+配置步骤：
+1. 访问 https://www.guosen.com.cn/gs/xxskills/index.html 注册/登录账号
+2. 登录后获取您的API Key。登录位置：网页一级标题栏-登录。登录后，点击账号，在弹窗上可一键复制API Key。
+3. API Key 由服务端通过环境变量统一管理，无需手动存储到文件
 
-     - API Key: [用户提供的API Key]
-     - 环境变量名: COZE_GUOSEN_API_KEY_7627056463827140634
-     - 配置时间: [当前时间]
-     ```
-
-2. **后续调用脚本时设置环境变量**：
-   - 从memory.md读取API Key
-   - 在调用脚本前设置环境变量：
-     ```python
-     import os
-     api_key = 从memory.md读取的API Key
-     os.environ["COZE_GUOSEN_API_KEY_7627056463827140634"] = api_key
-     ```
-   - 然后调用脚本执行ETF筛选
-
-3. **确认存储成功**：告知用户API Key已保存，后续使用无需重复配置
-
-**注意事项**：
-- memory.md用于智能体长期记忆，确保API Key在会话间保持有效
-- 环境变量 `COZE_GUOSEN_API_KEY_7627056463827140634` 是脚本读取API Key的唯一途径
-- 每次调用脚本前必须设置该环境变量，否则脚本将无法获取API Key
-- 如用户更换API Key，需同步更新memory.md中的配置
+**调用脚本时**：
+- 环境变量 `COZE_GUOSEN_API_KEY_7627056463827140634` 由服务端预配置
+- 脚本自动从环境变量读取 API Key
 
 ### 安装依赖
 
@@ -120,32 +100,21 @@ python /workspace/projects/gs-etf-filter/scripts/get_data.py --help
 
 智能体在调用脚本执行ETF筛选时，**必须**遵循以下流程：
 
-1. **检查并读取memory.md**：
-   - 检查 `./memory.md` 文件是否存在
-   - 读取其中的API Key和环境变量名
+1. **确认环境变量**：
+   - 脚本从环境变量 `COZE_GUOSEN_API_KEY_7627056463827140634` 读取 API Key（服务端预配置）
 
-2. **设置环境变量**：
-   ```python
-   import os
-   # 从memory.md读取API Key
-   api_key = "从memory.md读取的API Key"
-   # 设置环境变量
-   os.environ["COZE_GUOSEN_API_KEY_7627056463827140634"] = api_key
-   ```
-
-3. **调用脚本执行筛选**：
+2. **调用脚本执行筛选**：
    ```bash
    python /workspace/projects/gs-etf-filter/scripts/get_data.py [参数]
    ```
 
-4. **读取结果并展示**：
+3. **读取结果并展示**：
    - 读取脚本输出的txt或xlsx文件
    - 格式化展示ETF数据
 
 **注意事项**：
-- 每次调用脚本前都必须设置环境变量
-- 如果memory.md中不存在API Key，需要提示用户先配置
-- 环境变量名必须是 `COZE_GUOSEN_API_KEY_7627056463827140634`，不能更改
+- 环境变量 `COZE_GUOSEN_API_KEY_7627056463827140634` 由服务端统一管理
+- 如果 API 调用失败，提示用户检查 API Key 配置
 
 ## 输出说明
 
@@ -194,8 +163,7 @@ python /workspace/projects/gs-etf-filter/scripts/get_data.py --class1 1 --order-
 - 支持中英文输入
 - 筛选结果最多返回满足条件的前100只ETF
 - 脚本取数完成后，智能体应读取结果文件，直接向用户呈现数据表格和分析报告，不得展示文件路径
-- 智能体在首次配置API Key后，必须将API Key写入memory.md进行持久化存储
-- 后续使用时，智能体应从memory.md读取API Key，无需用户重复提供
+- API Key 由服务端通过环境变量统一管理，无需手动存储
 
 ## 必须输出的声明内容
 

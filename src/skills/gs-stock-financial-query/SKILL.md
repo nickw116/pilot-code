@@ -155,8 +155,8 @@ $env:GS_API_KEY="your_api_key_here"
 ### 步骤 1: 获取并配置 API Key
 
 **检查 API Key 配置**:
-- 尝试读取 `./memory.md` 文件中的 `GS_API_KEY` 字段
-- 如果文件不存在或字段未配置，引导用户获取
+- 从环境变量 `GS_API_KEY` 读取（服务端预配置）
+- 如果环境变量未配置，引导用户获取
 
 **获取 API Key**（当未配置时）:
 1. 访问国信证券 Skill 聚合网站: https://www.guosen.com.cn/gs/xxskills/index.html
@@ -164,17 +164,9 @@ $env:GS_API_KEY="your_api_key_here"
 3. 点击网页顶部「登录」按钮
 4. 登录后点击账号，在弹窗中一键复制 API Key
 
-**保存 API Key**:
-- 注册成功后，**立即**将以下内容写入 `./memory.md`:
-  ```markdown
-  GS_API_KEY=your_actual_api_key_here
-  ```
-- 如果 `./memory.md` 文件不存在，创建该文件并写入上述内容
-- 如果文件已存在，添加或更新 `GS_API_KEY` 字段
-
 **使用脚本读取 API Key**:
 - 调用 `scripts/get_data.py` 时，脚本会自动从环境变量读取 `GS_API_KEY`
-- 智能体需要先从 `./memory.md` 读取 `GS_API_KEY`，然后将其设置为环境变量供脚本使用
+- 环境变量由服务端统一管理，无需手动存储
 
 ### 步骤 2: 执行查询
 1. 根据用户需求选择查询接口:
@@ -262,7 +254,7 @@ result = query_hk_stock_cash_flow_statement("02020")
 → 检查证券代码是否正确，确认市场代码是否匹配
 
 ## 合规说明
-- API Key 需要从 `./memory.md` 的 `GS_API_KEY` 字段读取，不要硬编码
+- API Key 从环境变量 `GS_API_KEY` 读取，由服务端统一管理
 - 调用脚本前必须设置环境变量 `GS_API_KEY`
 - **重要**: 如果 API 调用失败，直接提醒用户"数据获取失败"，**不要**尝试从联网搜索或其他渠道获取数据
 - 禁止在代码或提示词中硬编码账号 ID 或 token。
