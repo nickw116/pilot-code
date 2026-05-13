@@ -191,12 +191,19 @@ export class AcpClient {
     return result.sessionId;
   }
 
-  async prompt(text: string): Promise<{ stopReason: string; content: string }> {
+  async prompt(text: string, images?: { data: string; mimeType: string }[]): Promise<{ stopReason: string; content: string }> {
     if (!this.sessionId) throw new Error("No active ACP session");
+
+    const prompt: any[] = [{ type: "text", text }];
+    if (images && images.length > 0) {
+      for (const img of images) {
+        prompt.push({ type: "image", data: img.data, mimeType: img.mimeType });
+      }
+    }
 
     const result = await this.request("session/prompt", {
       sessionId: this.sessionId,
-      prompt: [{ type: "text", text }],
+      prompt,
     });
 
     return {

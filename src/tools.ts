@@ -69,7 +69,7 @@ function makeResolve(workspaceRoot: string) {
   };
 }
 
-export function createUserTools(workspaceRoot: string, allowedTools?: string[]): AgentTool<TSchema, string | Record<string, unknown>>[] {
+export function createUserTools(workspaceRoot: string, allowedTools?: string[], getImages?: () => { data: string; mimeType: string }[] | undefined): AgentTool<TSchema, string | Record<string, unknown>>[] {
   ensureWorkspace(workspaceRoot);
   const resolve = makeResolve(workspaceRoot);
 
@@ -247,7 +247,8 @@ export function createUserTools(workspaceRoot: string, allowedTools?: string[]):
   ): Promise<AgentToolResult<string>> {
     try {
       const client = await ensureAcp();
-      const result = await client.prompt(params.prompt);
+      const images = getImages?.();
+      const result = await client.prompt(params.prompt, images);
       const text = result.content || "(opencode completed with no text output)";
       return {
         content: [{ type: "text", text }],
@@ -323,7 +324,8 @@ export function createUserTools(workspaceRoot: string, allowedTools?: string[]):
   ): Promise<AgentToolResult<string>> {
     try {
       const client = await ensureClaudeAcp();
-      const result = await client.prompt(params.prompt);
+      const images = getImages?.();
+      const result = await client.prompt(params.prompt, images);
       const text = result.content || "(Claude Code completed with no text output)";
       return {
         content: [{ type: "text", text }],

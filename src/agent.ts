@@ -146,6 +146,7 @@ interface AgentEntry {
 }
 
 const agents = new Map<string, AgentEntry>();
+const currentImages = new Map<string, ImageContent[]>();
 
 function getAgent(sessionKey: string, userId: number, modelId?: string, agentId?: string): Agent {
   const existing = agents.get(sessionKey);
@@ -161,7 +162,12 @@ function getAgent(sessionKey: string, userId: number, modelId?: string, agentId?
   if (!model) throw new Error(`Unknown model: ${resolvedModelId}`);
 
   const resolvedAgentId = agentId || "main";
-  const userTools = createUserTools(getUserWorkspaceDir(userId, resolvedAgentId), ac?.tools);
+  const sk = sessionKey;
+  const userTools = createUserTools(
+    getUserWorkspaceDir(userId, resolvedAgentId),
+    ac?.tools,
+    () => currentImages.get(sk),
+  );
 
   const skillSummary = buildSkillSummary();
   const fullSystemPrompt = systemPrompt + skillSummary;
@@ -268,6 +274,10 @@ async function doRunPromptWithRunId(runId: string, message: string, sessionKey: 
 
   console.log(`[agent] doRun: model=${modelId} hasImages=${!!images} imageCount=${images?.length || 0}`);
 
+  if (images && images.length > 0) {
+    currentImages.set(sessionKey, images);
+  }
+
   try {
     await agent.prompt(message, images);
   } catch (err: any) {
@@ -283,6 +293,7 @@ async function doRunPromptWithRunId(runId: string, message: string, sessionKey: 
     errorMsg = errMsg || "Agent error";
   } finally {
     currentRunIds.delete(sessionKey);
+    currentImages.delete(sessionKey);
     const e = agents.get(sessionKey);
     if (e) e.lastActivityAt = Date.now();
   }
