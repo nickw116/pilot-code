@@ -1,6 +1,6 @@
 # stock-chart-analysis
 
-金融技术分析六大模块 —— 均线 + 头肩底 + 缠论 + 筹码 + 三档理论 + 基本面。
+金融技术分析六大模块 —— 均线 + 头肩底 + 缠论 + 筹码 + 三档理论 + 基本面。图表输出：缠论图、头肩底颈线图、筹码图、信息图。
 
 ## 触发条件
 
@@ -116,8 +116,8 @@ python generate_analysis.py --symbol 600519 --name 贵州茅台 --days 120
 -> [三档] 旋转射线法 → 三档趋势线 → 第三点 → 潜龙信号
 -> [基本面] 利润表 + 资产负债表 + 现金流量表
 -> 输出 JSON 分析报告到 stdout
--> 生成缠论分析图 PNG
--> 生成三档战法图 PNG（含趋势线+第三点标注）
+-> 生成缠论分析图 PNG（K线+白色笔+分型+中枢+背驰）
+-> 生成头肩底颈线分析图 PNG（左肩/头部/右肩标记+颈线+目标价）
 -> 生成筹码分布图 PNG（通达信风格）
 -> 生成竖版信息图 PNG（1080x1920）
 -> 自动上传所有图表到 COS，返回公开 URL
@@ -127,6 +127,73 @@ python generate_analysis.py --symbol 600519 --name 贵州茅台 --days 120
 
 ### 图表交付规则
 所有生成的图表必须以内联预览形式呈现（MEDIA 标签或图片嵌入），**禁止输出下载链接或 URL 表格**。
+
+### 文字分析报告规范
+
+JSON 数据输出后，**必须**按以下结构生成中文文字分析报告，六大模块缺一不可：
+
+```
+## 📊 {股票名称}（{代码}）技术分析报告
+
+**当前价格**: {close}  **涨跌幅**: {change_pct}%  **分析日期**: {analysis_date}
+
+---
+
+### 1️⃣ 均线分析
+- MA5={ma5} MA10={ma10} MA20={ma20}
+- 均线排列：{arrangement}（多头排列/空头排列/均线纠缠）
+- 趋势判断
+
+### 2️⃣ 头肩底形态
+- 若 detected=true：
+  - 左肩: {left_shoulder.price}（{left_shoulder.date}）
+  - 头部: {head.price}（{head.date}）
+  - 右肩: {right_shoulder.price}（{right_shoulder.date}）
+  - 颈线: {neckline}  目标价: {target_price}
+  - 信号: {signal}（突破颈线确认/接近颈线/形态形成中）
+  - 量能形态: {volume_pattern}
+  - 操作: {action}
+- 若 detected=false：
+  - "当前未检测到头肩底形态"
+
+### 3️⃣ 缠论分析
+- 走势: {trend}
+- 分型: {top_fractals_count}个顶分型, {bottom_fractals_count}个底分型
+- 笔: {pens_count}笔  线段: {segments_count}段  中枢: {centers_count}个
+- 买卖点: 逐一列出 {buy_sell_points} 的类型和原因
+- 背驰: 逐一列出 {divergences} 的类型、置信度、说明
+
+### 4️⃣ 筹码分析
+- 获利盘: {profit_ratio}%  平均成本: {avg_cost}  峰值: {peak_price}
+- 集中度(90%): {concentration}%  主力成本区: {main_force_low} ~ {main_force_high}
+- CYS: {cys}%  交易信号: {signals[0].signal} — {signals[0].detail}
+
+### 5️⃣ 三档战法
+- 当前位置: {current_position}
+- 潜龙信号: {hidden_dragon_signal}
+- 各档状态: 一档角度{angle}°/状态  二档... 三档...
+- 操作建议: {recommendation}
+
+### 6️⃣ 基本面
+- 利润表: 营收{revenue}亿(同比{revenue_yoy}%)  净利润{net_profit}亿  ROE {roe}%  EPS {eps}
+- 资产负债表: 负债率{debt_ratio}  流动比率{current_ratio}  每股净资产{bvps}
+- 现金流: 经营现金流{operating_cash_flow}亿  自由现金流{free_cash_flow}亿
+- 资金流向: 主力净{流入/流出}{main_net_inflow}亿
+
+---
+
+### 📋 综合操作建议
+将 recommendation 数组中的建议逐条列出，按优先级排序。
+
+### 图表
+内联展示生成的图表（缠论图、头肩底颈线图、筹码图、信息图）。
+```
+
+**关键要求**：
+1. 六大模块**必须全部输出**，不得省略任何模块
+2. 头肩底 detected=false 时也必须输出"未检测到"的说明
+3. 所有内容使用中文
+4. 禁止输出 KDJ/RSI/DMI/SAR/布林带等不在六大模块内的指标
 
 ### JSON 报告结构
 
@@ -165,8 +232,8 @@ python generate_analysis.py --symbol 600519 --name 贵州茅台 --days 120
 
 | 图表 | 文件前缀 | 内容 |
 |------|---------|------|
-| 缠论图 | `chanlun_` | K线+分型+笔+线段+中枢+背驰+MACD副图+成交量 |
-| 三档图 | `dow_` | K线+三档趋势线(绿/金/红)+第三点标注+延长虚线+成交量 |
+| 缠论图 | `chanlun_` | K线+白色笔线+分型标记(红/绿)+中枢+背驰+MACD副图+成交量 |
+| 头肩底图 | `hsb_` | K线+左肩/头部/右肩标记+颈线(黄虚线)+目标价(绿虚线)+信号面板+成交量 |
 | 筹码图 | `cyq_` | K线+右侧筹码分布+关键价位线+指标面板 |
 | 信息图 | `infographic_` | 竖版1080x1920，六大模块卡片+操作建议 |
 

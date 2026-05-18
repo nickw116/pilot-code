@@ -9,7 +9,7 @@
         <div class="bot-mouth"></div>
         <div class="bot-antenna"></div>
       </div>
-      <h2>PILOT CODE</h2>
+      <h2>PILOT AGENT</h2>
       <van-cell-group inset class="login-fields">
         <van-field :model-value="username" @update:model-value="$emit('update:username', $event)" label="用户名" placeholder="用户名" />
         <van-field :model-value="password" @update:model-value="$emit('update:password', $event)" label="密码" type="password" placeholder="密码" />

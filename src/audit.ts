@@ -1,7 +1,7 @@
 import fs from "fs";
 import path from "path";
 
-const AUDIT_DIR = path.join(import.meta.dirname, "..", "data", "audit");
+const AUDIT_DIR = path.join(process.cwd(), "data", "audit");
 
 function getAuditFile(): string {
   const d = new Date();

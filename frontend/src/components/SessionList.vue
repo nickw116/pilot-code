@@ -29,7 +29,8 @@
             </svg>
           </div>
           <div class="session-info">
-            <div class="session-title">{{ s.title || formatTitle(s) }}</div>
+            <div class="session-name">{{ getAgentName(s) }}</div>
+            <div class="session-time">{{ formatTime(s) }}</div>
           </div>
           <button
             v-if="!s.active"
@@ -146,19 +147,20 @@ async function handleDelete(s) {
   }
 }
 
-function formatTitle(s) {
+function getAgentName(s) {
   const agentId = s.agentId || ''
-  const agentName = props.agents.find(a => a.id === agentId)?.name || agentId || '会话'
+  return props.agents.find(a => a.id === agentId)?.name || agentId || '会话'
+}
+
+function formatTime(s) {
   const ts = s.createdAt
-  if (ts) {
-    const d = new Date(typeof ts === 'number' && ts < 1e12 ? ts * 1000 : ts)
-    const mm = String(d.getMonth() + 1).padStart(2, '0')
-    const dd = String(d.getDate()).padStart(2, '0')
-    const hh = String(d.getHours()).padStart(2, '0')
-    const mi = String(d.getMinutes()).padStart(2, '0')
-    return `${agentName} · ${mm}/${dd} ${hh}:${mi}`
-  }
-  return agentName
+  if (!ts) return ''
+  const d = new Date(typeof ts === 'number' && ts < 1e12 ? ts * 1000 : ts)
+  const mm = String(d.getMonth() + 1).padStart(2, '0')
+  const dd = String(d.getDate()).padStart(2, '0')
+  const hh = String(d.getHours()).padStart(2, '0')
+  const mi = String(d.getMinutes()).padStart(2, '0')
+  return `${mm}/${dd} ${hh}:${mi}`
 }
 </script>
 
@@ -265,15 +267,22 @@ function formatTitle(s) {
   flex: 1;
   min-width: 0;
 }
-.session-title {
+.session-name {
   font-size: 14px;
   font-weight: 500;
   color: var(--text);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  line-height: 1.3;
 }
-.session-item.active .session-title {
+.session-time {
+  font-size: 12px;
+  color: #999;
+  line-height: 1.3;
+  margin-top: 2px;
+}
+.session-item.active .session-name {
   color: var(--primary);
   font-weight: 600;
 }

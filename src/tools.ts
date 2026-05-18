@@ -3,12 +3,65 @@ import fs from "fs";
 import path from "path";
 import { Type, type Static, type TSchema } from "@mariozechner/pi-ai";
 import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
-import { AcpClient } from "./acp-client.js";
+import { AcpClient, type AcpLogEvent } from "./acp-client.js";
+import { publish } from "./sse.js";
+import { appendAcpLog } from "./session.js";
 import { loadAllSkills, loadSkillContent } from "./skills/index.js";
+import {
+  appendToLongTermMemory,
+  appendDailyNote,
+  searchMemory as searchMemoryFiles,
+} from "./memory.js";
+import {
+  snapshotWorkspace,
+  findChangedFiles,
+  callMimoReview,
+} from "./review.js";
+
+let currentSseSessionKey: string | null = null;
+let currentSseRunId: string | null = null;
+let acpLogSeq = 0;
+
+export function setAcpSseContext(sessionKey: string, runId: string): void {
+  currentSseSessionKey = sessionKey;
+  currentSseRunId = runId;
+  acpLogSeq = 0;
+}
+
+export function clearAcpSseContext(): void {
+  currentSseSessionKey = null;
+  currentSseRunId = null;
+}
+
+const SKIP_PERSIST_TYPES = new Set(["text_delta", "reasoning"]);
+
+function publishAcpLog(event: AcpLogEvent): void {
+  if (!currentSseSessionKey || !currentSseRunId) return;
+  const seq = acpLogSeq++;
+  publish(currentSseSessionKey, {
+    eventId: "",
+    kind: "acp.log_event",
+    runId: currentSseRunId,
+    sessionKey: currentSseSessionKey,
+    payload: {
+      type: event.type,
+      tool: event.tool || null,
+      text: event.text,
+      detail: event.detail || null,
+      durationMs: event.durationMs || null,
+    },
+  });
+  if (SKIP_PERSIST_TYPES.has(event.type)) return;
+  try {
+    appendAcpLog(currentSseSessionKey, currentSseRunId, event, seq);
+  } catch (err) {
+    console.error("[acp] failed to persist log:", err);
+  }
+}
 
 const DEFAULT_WORKSPACE = path.resolve(
   process.env.WORKSPACE_DIR ||
-    path.join(import.meta.dirname, "..", "data", "workspace")
+    path.join(process.cwd(), "data", "workspace")
 );
 
 const DANGEROUS_COMMANDS = [
@@ -24,7 +77,8 @@ const DANGEROUS_COMMANDS = [
   /\bshutdown\b/i,
   /\breboot\b/i,
   /\binit\s+[06]\b/,
-  /\bsystemctl\s+(stop|disable)\s+/i,
+  /\bsystemctl\s+(stop|disable|restart|reload)\s+/i,
+  /\bservice\s+\w+\s+(stop|restart|reload)\s*/i,
   />\/dev\/sd/i,
 ];
 
@@ -42,13 +96,18 @@ const AGENTS_MD_CONTENT = `# AGENTS.md
 ## 项目说明
 这是你的工作目录。你可以在这里读写文件、运行命令。
 
-## 可用工具
-- read: 读取文件/目录
-- write: 创建/覆盖文件
-- edit: 精确替换文件中的文本
-- bash: 执行 shell 命令
+## Pilot Agent 项目路径
+Pilot Agent 项目代码在 /home/ubuntu/pilot-agent/ 目录下：
+- 后端入口：/home/ubuntu/pilot-agent/src/index.ts
+- Agent 逻辑：/home/ubuntu/pilot-agent/src/agent.ts
+- SSE 事件桥接：/home/ubuntu/pilot-agent/src/event-bridge.ts
+- 前端代码：/home/ubuntu/pilot-agent/frontend/src/
+- Agent 配置：/home/ubuntu/pilot-agent/agents.json
+- 环境配置：/home/ubuntu/pilot-agent/.env
 
 ## 注意事项
+- 修改 Pilot Agent 代码时，在 /home/ubuntu/pilot-agent/ 目录下操作
+- 不要去 /home/ubuntu/.openclaw/ 目录，那是另一个项目
 - 修改文件前先读取
 - 用 edit 而非 write 做局部修改
 `;
@@ -69,7 +128,7 @@ function makeResolve(workspaceRoot: string) {
   };
 }
 
-export function createUserTools(workspaceRoot: string, allowedTools?: string[], getImages?: () => { data: string; mimeType: string }[] | undefined): AgentTool<TSchema, string | Record<string, unknown>>[] {
+export function createUserTools(workspaceRoot: string, allowedTools?: string[], getImages?: () => { data: string; mimeType: string }[] | undefined): { tools: AgentTool<TSchema, string | Record<string, unknown>>[]; dispose: () => Promise<void> } {
   ensureWorkspace(workspaceRoot);
   const resolve = makeResolve(workspaceRoot);
 
@@ -208,6 +267,7 @@ export function createUserTools(workspaceRoot: string, allowedTools?: string[], 
       await acpClient.stop().catch(() => {});
     }
     acpClient = new AcpClient();
+    acpClient.setLogHandler(publishAcpLog);
     await acpClient.start(workspaceRoot, (method, params) => {
       console.debug("[acp] notification:", method, JSON.stringify(params).slice(0, 200));
     });
@@ -228,8 +288,9 @@ export function createUserTools(workspaceRoot: string, allowedTools?: string[], 
       args: process.env.CLAUDE_CODE_ACP_ARGS?.split(" ") || [
         "/home/ubuntu/.openclaw/npm/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js",
       ],
-      clientInfo: { name: "pilot-code-claude", title: "Pilot Code (Claude)", version: "0.1.0" },
+      clientInfo: { name: "pilot-agent-claude", title: "Pilot Agent (Claude)", version: "0.1.0" },
     });
+    claudeAcpClient.setLogHandler(publishAcpLog);
     await claudeAcpClient.start(workspaceRoot, (method, params) => {
       console.debug("[claude-acp] notification:", method, JSON.stringify(params).slice(0, 200));
     });
@@ -245,28 +306,40 @@ export function createUserTools(workspaceRoot: string, allowedTools?: string[], 
     params: Static<typeof OpenCodeParams>,
     signal?: AbortSignal
   ): Promise<AgentToolResult<string>> {
-    try {
-      const client = await ensureAcp();
-      const images = getImages?.();
-      const result = await client.prompt(params.prompt, images);
-      const text = result.content || "(opencode completed with no text output)";
-      return {
-        content: [{ type: "text", text }],
-        details: text,
-      };
-    } catch (err: any) {
-      const msg = err?.message || String(err);
-      if (msg.includes("ENOENT") || msg.includes("spawn")) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const client = await ensureAcp();
+        const images = getImages?.();
+        const result = await client.prompt(params.prompt, images);
+        const text = result.content || "(opencode completed with no text output)";
         return {
-          content: [{ type: "text", text: "opencode 命令未找到。请确认 opencode 已安装并在 PATH 中。" }],
-          details: "opencode not found",
+          content: [{ type: "text", text }],
+          details: text,
+        };
+      } catch (err: any) {
+        const msg = err?.message || String(err);
+        if (msg.includes("ENOENT") || msg.includes("spawn")) {
+          return {
+            content: [{ type: "text", text: "opencode 命令未找到。请确认 opencode 已安装并在 PATH 中。" }],
+            details: "opencode not found",
+          };
+        }
+        if ((msg.includes("timeout") || msg.includes("ACP process exited")) && attempt === 0) {
+          console.warn("[acp] opencode failure, restarting client and retrying...");
+          acpReady = false;
+          if (acpClient) await acpClient.stop().catch(() => {});
+          continue;
+        }
+        return {
+          content: [{ type: "text", text: `opencode 错误: ${msg}` }],
+          details: msg,
         };
       }
-      return {
-        content: [{ type: "text", text: `opencode 错误: ${msg}` }],
-        details: msg,
-      };
     }
+    return {
+      content: [{ type: "text", text: "opencode 错误: 重试后仍然超时" }],
+      details: "timeout after retry",
+    };
   }
 
   function getAcpClientInner(): AcpClient | null {
@@ -322,37 +395,123 @@ export function createUserTools(workspaceRoot: string, allowedTools?: string[], 
     params: Static<typeof ClaudeCodeParams>,
     signal?: AbortSignal
   ): Promise<AgentToolResult<string>> {
-    try {
-      const client = await ensureClaudeAcp();
-      const images = getImages?.();
-      const result = await client.prompt(params.prompt, images);
-      const text = result.content || "(Claude Code completed with no text output)";
-      return {
-        content: [{ type: "text", text }],
-        details: text,
-      };
-    } catch (err: any) {
-      const msg = err?.message || String(err);
-      if (msg.includes("ENOENT") || msg.includes("spawn")) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const client = await ensureClaudeAcp();
+        const images = getImages?.();
+        const result = await client.prompt(params.prompt, images);
+        const text = result.content || "(Claude Code completed with no text output)";
         return {
-          content: [{ type: "text", text: "Claude Code ACP 未找到。请确认 @agentclientprotocol/claude-agent-acp 已安装。" }],
-          details: "claude-agent-acp not found",
+          content: [{ type: "text", text }],
+          details: text,
+        };
+      } catch (err: any) {
+        const msg = err?.message || String(err);
+        if (msg.includes("ENOENT") || msg.includes("spawn")) {
+          return {
+            content: [{ type: "text", text: "Claude Code ACP 未找到。请确认 @agentclientprotocol/claude-agent-acp 已安装。" }],
+            details: "claude-agent-acp not found",
+          };
+        }
+        if ((msg.includes("timeout") || msg.includes("ACP process exited")) && attempt === 0) {
+          console.warn("[claude-acp] failure, restarting client and retrying...");
+          claudeAcpReady = false;
+          if (claudeAcpClient) await claudeAcpClient.stop().catch(() => {});
+          continue;
+        }
+        return {
+          content: [{ type: "text", text: `Claude Code 错误: ${msg}` }],
+          details: msg,
         };
       }
-      return {
-        content: [{ type: "text", text: `Claude Code 错误: ${msg}` }],
-        details: msg,
-      };
     }
+    return {
+      content: [{ type: "text", text: "Claude Code 错误: 重试后仍然超时" }],
+      details: "timeout after retry",
+    };
   }
 
-  if (process.env.CLAUDE_CODE_ENABLED === "true" || process.env.CLAUDE_CODE_ACP_COMMAND) {
+  if (process.env.CLAUDE_CODE_DISABLED !== "true") {
+    const REVIEW_ENABLED = process.env.REVIEW_ENABLED !== "false";
+    const MAX_REVIEW_ROUNDS = 2;
+
+    async function doClaudeCodeWithReview(
+      params: Static<typeof ClaudeCodeParams>,
+      signal?: AbortSignal
+    ): Promise<AgentToolResult<string>> {
+      const snapshot = REVIEW_ENABLED
+        ? snapshotWorkspace(workspaceRoot)
+        : null;
+
+      let result = await doClaudeCode(params, signal);
+
+      if (!snapshot) return result;
+
+      const changes = findChangedFiles(workspaceRoot, snapshot);
+      if (changes.length === 0) return result;
+
+      for (let round = 0; round < MAX_REVIEW_ROUNDS; round++) {
+        if (signal?.aborted) break;
+
+        publishAcpLog({
+          type: "tool_start",
+          tool: "mimo_review",
+          text: `MIMO 自动 Review 第 ${round + 1} 轮 (${changes.length} 个文件)`,
+        });
+
+        const resultText = result.content
+          .map((c: any) => (c.type === "text" ? c.text : ""))
+          .join("");
+        const review = await callMimoReview(
+          params.prompt,
+          resultText,
+          changes
+        );
+
+        publishAcpLog({
+          type: "tool_end",
+          tool: "mimo_review",
+          text: review.hasIssues
+            ? "发现问题，反馈给 Claude Code 自动修复..."
+            : "✅ 代码质量良好",
+        });
+
+        if (!review.hasIssues) {
+          const text =
+            resultText +
+            `\n\n--- MIMO Review ✅ ---\n${review.review}`;
+          return { content: [{ type: "text", text }], details: result.details };
+        }
+
+        const fixPrompt = `你之前的代码修改经过了 MIMO 自动 Review，发现以下问题，请立即修复：
+
+${review.review}
+
+请直接修复所有问题，修改完成后简要说明修复了什么。`;
+
+        const newSnapshot = snapshotWorkspace(workspaceRoot);
+        result = await doClaudeCode({ prompt: fixPrompt }, signal);
+
+        const newChanges = findChangedFiles(workspaceRoot, newSnapshot);
+        if (newChanges.length === 0) break;
+        changes.length = 0;
+        changes.push(...newChanges);
+      }
+
+      return result;
+    }
+
     tools.push({
       name: "claude_code",
-      description: "Delegate a coding task to Claude Code (Anthropic's AI coding agent via ACP protocol). Use this for complex code analysis, refactoring, debugging, or multi-file edits. Claude Code can read/write files, run commands, and interact with you. Provide a clear description of what needs to be done.",
+      description:
+        "Delegate a coding task to Claude Code (Anthropic's AI coding agent via ACP protocol). Use this for complex code analysis, refactoring, debugging, or multi-file edits. Claude Code can read/write files, run commands, and interact with you. After Claude Code completes, MIMO automatically reviews the changes and feeds back issues for self-fixing. Provide a clear description of what needs to be done.",
       parameters: ClaudeCodeParams,
       label: "Claude Code",
-      execute: (_id, params, signal) => doClaudeCode(params as Static<typeof ClaudeCodeParams>, signal),
+      execute: (_id, params, signal) =>
+        doClaudeCodeWithReview(
+          params as Static<typeof ClaudeCodeParams>,
+          signal
+        ),
     });
   }
 
@@ -373,12 +532,80 @@ export function createUserTools(workspaceRoot: string, allowedTools?: string[], 
     execute: (_id, params) => Promise.resolve(doSkill(params as Static<typeof SkillParams>)),
   });
 
-  return allowedTools
+  // --- Memory tools (always available, not filtered) ---
+
+  const MemorySaveParams = Type.Object({
+    content: Type.String({ description: "Content to save to memory" }),
+    type: Type.Union([
+      Type.Literal("long_term"),
+      Type.Literal("daily"),
+    ], { description: "'long_term' = durable facts/preferences (MEMORY.md), 'daily' = today's note" }),
+  });
+
+  function doMemorySave(params: Static<typeof MemorySaveParams>): AgentToolResult<string> {
+    if (params.type === "long_term") {
+      appendToLongTermMemory(workspaceRoot, params.content);
+      return { content: [{ type: "text", text: "已保存到长期记忆 (MEMORY.md)" }], details: "saved to MEMORY.md" };
+    } else {
+      appendDailyNote(workspaceRoot, params.content);
+      return { content: [{ type: "text", text: "已保存到今日笔记" }], details: "saved to daily note" };
+    }
+  }
+
+  const MemorySearchParams = Type.Object({
+    query: Type.String({ description: "Search query to find relevant memories" }),
+  });
+
+  function doMemorySearch(params: Static<typeof MemorySearchParams>): AgentToolResult<string> {
+    const results = searchMemoryFiles(workspaceRoot, params.query);
+    if (results.length === 0) {
+      return { content: [{ type: "text", text: "未找到相关记忆" }], details: "no results" };
+    }
+    const text = results.join("\n---\n");
+    return { content: [{ type: "text", text }], details: text };
+  }
+
+  const memoryTools: AgentTool<TSchema, string | Record<string, unknown>>[] = [
+    {
+      name: "memory_save",
+      description: "Save important information to persistent memory. Use 'long_term' for durable facts, user preferences, and standing decisions. Use 'daily' for observations and session summaries.",
+      parameters: MemorySaveParams,
+      label: "Memory Save",
+      execute: (_id, params) => Promise.resolve(doMemorySave(params as Static<typeof MemorySaveParams>)),
+    },
+    {
+      name: "memory_search",
+      description: "Search across all memory files (MEMORY.md and daily notes) for relevant information. Use this before answering questions to check if relevant context was previously saved.",
+      parameters: MemorySearchParams,
+      label: "Memory Search",
+      execute: (_id, params) => Promise.resolve(doMemorySearch(params as Static<typeof MemorySearchParams>)),
+    },
+  ];
+
+  const filtered = allowedTools
     ? tools.filter((t) => allowedTools.includes(t.name))
     : tools;
+
+  // Memory tools are always available regardless of agent tool restrictions
+  filtered.push(...memoryTools);
+
+  async function dispose(): Promise<void> {
+    if (acpClient) {
+      await acpClient.dispose().catch(() => {});
+      acpClient = null;
+      acpReady = false;
+    }
+    if (claudeAcpClient) {
+      await claudeAcpClient.dispose().catch(() => {});
+      claudeAcpClient = null;
+      claudeAcpReady = false;
+    }
+  }
+
+  return { tools: filtered, dispose };
 }
 
-export const tools = createUserTools(DEFAULT_WORKSPACE);
+export const tools = createUserTools(DEFAULT_WORKSPACE).tools;
 
 export function getUserWorkspaceDir(userId: number, agentId?: string): string {
   const base = path.join(DEFAULT_WORKSPACE, `user-${userId}`);

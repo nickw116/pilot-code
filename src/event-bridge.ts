@@ -30,15 +30,23 @@ function sse(
 }
 
 let accumulatedText = "";
+let accumulatedThinking = "";
 
 function translate(
   event: AgentEvent,
   runId: string,
   sessionKey: string
 ): SseEvent[] {
+  if (event.type === "message_update") {
+    const sub = event.assistantMessageEvent;
+    if (sub.type === "text_delta" || sub.type === "thinking_delta") {
+      console.log(`[bridge] ${sub.type} len=${(sub.delta || "").length} textAcc=${accumulatedText.length} thinkAcc=${accumulatedThinking.length}`);
+    }
+  }
   switch (event.type) {
     case "agent_start":
       accumulatedText = "";
+      accumulatedThinking = "";
       return [sse("run.started", runId, sessionKey)];
 
     case "message_update": {
@@ -48,8 +56,8 @@ function translate(
         return [sse("assistant.delta", runId, sessionKey, { delta: sub.delta })];
       }
       if (sub.type === "thinking_delta" && sub.delta) {
-        accumulatedText += sub.delta;
-        return [sse("assistant.delta", runId, sessionKey, { delta: sub.delta })];
+        accumulatedThinking += sub.delta;
+        return [sse("assistant.thinking", runId, sessionKey, { delta: sub.delta })];
       }
       if (sub.type === "toolcall_start") {
         const subAny = sub as any;

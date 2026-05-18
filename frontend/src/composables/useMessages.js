@@ -85,6 +85,7 @@ export function createAiMessage(id = Date.now() + 1) {
     id,
     role: 'assistant',
     content: '',
+    thinking: '',
     acpContent: '',
     acpExpanded: true,
     acpSteps: [],
@@ -277,6 +278,15 @@ export function useMessages(ctx) {
   }
 
   /**
+   * Handle assistant.thinking event (reasoning content, separate from main text).
+   */
+  function applyThinkingDelta(delta) {
+    if (!delta) return
+    const aiMsg = ensureCurrentAssistantMsg()
+    aiMsg.thinking = (aiMsg.thinking || '') + delta
+  }
+
+  /**
    * Handle full_result event (overwrites content if clearly more complete).
    */
   function applyFullResult(fullText) {
@@ -297,6 +307,7 @@ export function useMessages(ctx) {
     } else if (fullText.length > currentContent.length * 1.5) {
       aiMsg.content = fullText
     }
+    aiMsg.thinking = ''
     syncMessageMediaFromContent(aiMsg, ctx.token.value)
   }
 
@@ -317,6 +328,7 @@ export function useMessages(ctx) {
     findActiveStreaming,
     findLastAssistant,
     applyAssistantDelta,
+    applyThinkingDelta,
     applyFullResult,
     visibleSteps,
   }

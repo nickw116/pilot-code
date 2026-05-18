@@ -1,0 +1,17 @@
+[Unit]
+Description=Pilot Agent Bridge
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/pilot-agent
+ExecStart=/usr/bin/node --import /home/ubuntu/pilot-agent/node_modules/tsx/dist/loader.mjs /home/ubuntu/pilot-agent/node_modules/tsx/dist/cli.mjs src/index.ts
+Restart=on-failure
+RestartSec=5
+Environment=NODE_ENV=production
+Environment=PATH=/usr/bin:/usr/local/bin:/home/ubuntu/.npm-global/bin
+Environment=HOME=/home/ubuntu
+
+[Install]
+WantedBy=multi-user.target

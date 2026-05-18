@@ -26,25 +26,32 @@
         :sse-reconnecting="eventStream.reconnecting"
         :models="models"
         :session-key="sessionKey"
+        :current-agent-id="currentAgentId"
+        :monitor-mode="monitorMode"
+        :monitor-messages="monitorMessages"
+        :monitor-history-loading="monitorLoading"
+        :monitor-user-info="monitorUserInfo"
+        :can-access-monitor="canAccessMonitor"
         @update:input-text="inputText = $event"
         @send="handleSend"
         @abort="handleAbort"
         @upload="handleUpload"
         @remove-attachment="removeAttachment"
         @open-settings="showSettings = true"
-        @open-sessions="showSessions = true"
         @hot-refresh="handleHotRefresh"
         @switch-model="handleSwitchModel"
+        @open-monitor="showMonitor = true"
+        @exit-monitor="handleExitMonitor"
       />
     </router-view>
 
-    <SessionList
-      v-model:show="showSessions"
+    <SessionMonitor
+      v-if="canAccessMonitor"
+      v-model:show="showMonitor"
       :token="token"
-      :current-session-key="sessionKey"
-      :current-agent-id="currentAgentId"
       :agents="agents"
-      @switch="handleSwitchSession"
+      :current-session-key="sessionKey"
+      @view-session="handleViewMonitorSession"
       @new="handleNewSession"
     />
 
@@ -63,16 +70,16 @@
 </template>
 
 <script setup>
-import { ref, onBeforeUnmount, onMounted, watch } from 'vue'
+import { ref, computed, onBeforeUnmount, onMounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuth } from './composables/useAuth.js'
 import { useChat, setStreamMode } from './composables/useChat.js'
 import { showNotify } from 'vant'
 import { useEventStream } from './composables/useEventStream.js'
 import { useServiceStatus } from './composables/useServiceStatus.js'
-import SessionList from './components/SessionList.vue'
+import SessionMonitor from './components/SessionMonitor.vue'
 import SettingsPopup from './components/SettingsPopup.vue'
-import { API_BASE, API_SESSION, API_SESSIONS, API_SESSION_NEW, API_MODEL_SWITCH, API_AGENTS } from './constants/index.js'
+import { API_BASE, API_SESSION, API_SESSIONS, API_SESSION_NEW, API_MODEL_SWITCH, API_AGENTS, API_ADMIN_SESSIONS, API_HISTORY } from './constants/index.js'
 
 const router = useRouter()
 
@@ -148,7 +155,6 @@ const eventStream = useEventStream(token, sessionKey, {
 })
 
 const showSettings = ref(false)
-const showSessions = ref(false)
 const currentModel = ref('')
 const models = ref([])
 const agents = ref([])
@@ -156,6 +162,24 @@ const currentAgentId = ref('main')
 const { serviceStatus } = useServiceStatus()
 let modelPollTimer = null
 const MODEL_POLL_INTERVAL = 30000
+let _historyLoading = false
+
+// --- Monitor mode state ---
+const showMonitor = ref(false)
+const monitorMode = ref(false)
+const monitorSessionKey = ref('')
+const monitorMessages = ref([])
+const monitorLoading = ref(false)
+const monitorUserInfo = ref('')
+
+const canAccessMonitor = computed(() => {
+  return currentUser.value &&
+    (currentUser.value.allowedAgent === 'main' || currentUser.value.allowedAgent === 'dev')
+})
+
+const monitorEventStream = useEventStream(token, monitorSessionKey, {
+  onEvent: (event) => handleMonitorStreamEvent(event),
+})
 
 function normalizeModel(model) {
   return typeof model === 'string' ? model.trim() : ''
@@ -208,6 +232,7 @@ function applyCachedModelForSession(targetSession) {
 onMounted(async () => {
   const ok = await initFromStorage()
   if (ok) {
+    _historyLoading = true
     const LOAD_HISTORY_TIMEOUT = 5000
     const historyWithTimeout = Promise.race([
       loadHistory(),
@@ -218,6 +243,7 @@ onMounted(async () => {
     } catch (e) {
       console.warn('[App] loadHistory timed out:', e.message)
     }
+    _historyLoading = false
     fetchModel()
     fetchAgents()
     eventStream.connect()
@@ -225,9 +251,11 @@ onMounted(async () => {
     router.replace({ name: 'Login' })
   }
   document.addEventListener('visibilitychange', handleVisibilityChange)
+  window.addEventListener('beforeunload', handleBeforeUnload)
 })
 
 onBeforeUnmount(() => {
+  window.removeEventListener('beforeunload', handleBeforeUnload)
   eventStream.disconnect()
   stopModelPolling()
   document.removeEventListener('visibilitychange', handleVisibilityChange)
@@ -263,7 +291,9 @@ watch(
         sessionKey: activeSession,
       })
       eventStream.disconnect()
-      eventStream.connect()
+      if (!_historyLoading) {
+        eventStream.connect()
+      }
     }
   },
   { immediate: true }
@@ -274,9 +304,14 @@ watch(() => eventStream.connected.value, (isConnected, wasConnected) => {
   if (isConnected) {
     setStreamMode('events')
     console.debug('[App] switched to persistent SSE mode (v2)')
-    if (loading.value && !eventStream.lastDataAt.value) {
-      console.warn('[App] SSE reconnected but loading was stuck — resetting')
-      loading.value = false
+    if (loading.value) {
+      const connectedAt = eventStream.lastDataAt.value
+      setTimeout(() => {
+        if (loading.value && eventStream.lastDataAt.value === connectedAt) {
+          console.warn('[App] SSE connected but no events received in 3s — resetting stuck loading')
+          loading.value = false
+        }
+      }, 3000)
     }
   } else {
     setStreamMode('legacy')
@@ -288,9 +323,15 @@ watch(() => eventStream.connected.value, (isConnected, wasConnected) => {
   }
 })
 
+function handleBeforeUnload() {
+  eventStream.disconnect()
+  monitorEventStream.disconnect()
+}
+
 async function handleLogin() {
   const ok = await authLogin()
   if (ok) {
+    _historyLoading = true
     const LOAD_HISTORY_TIMEOUT = 5000
     const historyWithTimeout = Promise.race([
       loadHistory(),
@@ -301,6 +342,7 @@ async function handleLogin() {
     } catch (e) {
       console.warn('[App] loadHistory timed out:', e.message)
     }
+    _historyLoading = false
     fetchModel()
     fetchAgents()
     eventStream.connect()
@@ -445,13 +487,23 @@ async function fetchAgents() {
 
 function updateCurrentAgentId() {
   const sk = sessionKey.value
-  let parsed = 'main'
+  let parsed = null
   if (sk && sk.startsWith('agent:')) {
     const parts = sk.split(':')
     if (parts.length >= 2) {
       parsed = parts[1]
     }
   }
+  // 1. server-side preference
+  if (!parsed && currentUser.value?.preferredAgent) {
+    parsed = currentUser.value.preferredAgent
+  }
+  // 2. role default (allowedAgent)
+  if (!parsed && currentUser.value?.allowedAgent) {
+    parsed = currentUser.value.allowedAgent
+  }
+  // 3. ultimate fallback
+  if (!parsed) parsed = 'main'
   const allowed = agents.value.map(a => a.id)
   if (allowed.length > 0 && !allowed.includes(parsed)) {
     parsed = allowed[0]
@@ -477,6 +529,12 @@ async function handleSwitchAgent(agentId) {
       const data = await r.json()
       sessionKey.value = data.sessionKey
       currentAgentId.value = agentId
+      // Persist preference to server
+      fetch(`${API_BASE}/user/preferred-agent`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token.value}` },
+        body: JSON.stringify({ agent_id: agentId }),
+      }).catch(() => {})
       messages.value = []
       currentModel.value = ''
       await fetchModel()
@@ -525,16 +583,133 @@ function handleClearChat() {
 
 function handleLogout() {
   eventStream.disconnect()
+  monitorEventStream.disconnect()
   stopModelPolling()
   authLogout()
   chatReset()
   currentModel.value = ''
+  monitorMode.value = false
   showSettings.value = false
   router.push({ name: 'Login' })
 }
 
 function handleChangePassword(oldPw, newPw, callback) {
   changePassword(oldPw, newPw).then(callback)
+}
+
+// ── Monitor Mode ──
+
+function normalizeMonitorRole(role) {
+  const r = (role || '').toLowerCase()
+  if (['user', 'human', 'client', 'input'].includes(r)) return 'user'
+  if (['assistant', 'ai', 'agent', 'model', 'bot'].includes(r)) return 'assistant'
+  return role
+}
+
+async function handleViewMonitorSession(s) {
+  monitorMode.value = true
+  monitorSessionKey.value = s.sessionKey
+  monitorUserInfo.value = `${s.displayName || s.username} · ${s.agentId}`
+  monitorMessages.value = []
+  monitorLoading.value = true
+
+  try {
+    const params = new URLSearchParams({ sessionKey: s.sessionKey, limit: '200' })
+    const r = await fetch(`${API_BASE}${API_HISTORY}?${params}`, {
+      headers: { Authorization: `Bearer ${token.value}` },
+    })
+    if (r.ok) {
+      const data = await r.json()
+      const entries = data.entries || data.messages || []
+      monitorMessages.value = entries
+        .filter(e => e.content && !['NO_REPLY', 'HEARTBEAT_OK'].includes(e.content))
+        .map((e, i) => ({
+          id: e.id || i + 1,
+          role: normalizeMonitorRole(e.role),
+          content: e.content,
+          runId: e.runId,
+          files: [],
+          media: [],
+          steps: [],
+          acpLogs: [],
+        }))
+    }
+  } catch (err) {
+    console.error('[App] monitor loadHistory failed:', err)
+  } finally {
+    monitorLoading.value = false
+  }
+
+  // Start SSE for real-time streaming
+  monitorEventStream.connect()
+}
+
+function handleExitMonitor() {
+  monitorEventStream.disconnect()
+  monitorMode.value = false
+  monitorSessionKey.value = ''
+  monitorMessages.value = []
+  monitorUserInfo.value = ''
+}
+
+function handleMonitorStreamEvent(event) {
+  const kind = event.kind
+  if (!kind) return
+
+  if (kind === 'assistant.delta') {
+    const delta = event.payload?.delta || ''
+    if (!delta) return
+    const last = monitorMessages.value[monitorMessages.value.length - 1]
+    if (last && last.role === 'assistant' && last._streaming) {
+      last.content += delta
+    } else {
+      monitorMessages.value.push({
+        id: Date.now(),
+        role: 'assistant',
+        content: delta,
+        files: [],
+        media: [],
+        steps: [],
+        acpLogs: [],
+        _streaming: true,
+      })
+    }
+  } else if (kind === 'full_result') {
+    const text = event.payload?.text || ''
+    if (text) {
+      const last = monitorMessages.value[monitorMessages.value.length - 1]
+      if (last && last.role === 'assistant' && last._streaming) {
+        last.content = text
+        last._streaming = false
+      }
+    }
+  } else if (kind === 'run.done' || kind === 'run.end') {
+    const last = monitorMessages.value[monitorMessages.value.length - 1]
+    if (last && last._streaming) {
+      last._streaming = false
+    }
+  } else if (kind === 'assistant.thinking') {
+    // Ignore thinking deltas in monitor mode to keep it simple
+  } else if (kind === 'tool_use') {
+    const payload = event.payload || {}
+    const toolName = payload.name || payload.tool || 'tool'
+    const last = monitorMessages.value[monitorMessages.value.length - 1]
+    if (last && last.role === 'assistant') {
+      if (!last.steps) last.steps = []
+      last.steps.push({ name: toolName, status: 'running', output: '' })
+    }
+  } else if (kind === 'tool_result') {
+    const last = monitorMessages.value[monitorMessages.value.length - 1]
+    if (last && last.steps && last.steps.length > 0) {
+      const step = last.steps[last.steps.length - 1]
+      if (step.status === 'running') {
+        step.status = 'done'
+        step.output = event.payload?.output || ''
+      }
+    }
+  } else if (kind === 'snapshot') {
+    // Ignore snapshots in monitor mode
+  }
 }
 
 // ── Session Management ──

@@ -1,6 +1,6 @@
 ---
 name: gs_stock_market_query
-description: 查询沪深A股、北交所、港股、美股的实时行情、历史行情、资金流向、涨跌幅排名等。Invoke when user asks for stock quotes, market data, stock prices, historical data, fund flow, or stock rankings.
+description: 查询沪深A股、北交所、港股、美股的实时行情、历史行情、资金流向、涨跌幅排名等。Invoke when user asks for stock quotes, market data, stock prices, historical data, fund flow, or stock rankings. 注意：个股技术分析/综合分析请使用 stock-chart-analysis skill，本skill仅用于行情查询、板块排名、资金流向等。
 ---
 
 # 股市行情查询
@@ -190,8 +190,8 @@ $env:GS_API_KEY="your_api_key_here"
 ### 步骤 1: 获取并配置 API Key
 
 **检查 API Key 配置**:
-- 从环境变量 `GS_API_KEY` 读取（服务端预配置）
-- 如果环境变量未配置，引导用户获取
+- 尝试读取 `./memory.md` 文件中的 `GS_API_KEY` 字段
+- 如果文件不存在或字段未配置，引导用户获取
 
 **获取 API Key**（当未配置时）:
 1. 访问国信证券 Skill 聚合网站: https://www.guosen.com.cn/gs/xxskills/index.html
@@ -199,9 +199,17 @@ $env:GS_API_KEY="your_api_key_here"
 3. 点击网页顶部「登录」按钮
 4. 登录后点击账号，在弹窗中一键复制 API Key
 
+**保存 API Key**:
+- 注册成功后，**立即**将以下内容写入 `./memory.md`:
+  ```markdown
+  GS_API_KEY=your_actual_api_key_here
+  ```
+- 如果 `./memory.md` 文件不存在，创建该文件并写入上述内容
+- 如果文件已存在，添加或更新 `GS_API_KEY` 字段
+
 **使用脚本读取 API Key**:
 - 调用 `scripts/get_data.py` 时，脚本会自动从环境变量读取 `GS_API_KEY`
-- 环境变量由服务端统一管理，无需手动存储
+- 智能体需要先从 `./memory.md` 读取 `GS_API_KEY`，然后将其设置为环境变量供脚本使用
 
 ### 步骤 2: 执行查询
 1. 根据用户需求选择查询类型:
@@ -302,7 +310,7 @@ result = query_past_hq("600519", set_code=1, want_nums=20)
 - 返回数据仅供参考，不作为投资建议。
 
 ## 注意事项
-- API Key 从环境变量 `GS_API_KEY` 读取，由服务端统一管理
+- API Key 需要从 `./memory.md` 的 `GS_API_KEY` 字段读取，不要硬编码
 - 调用脚本前必须设置环境变量 `GS_API_KEY`
 - **重要**: 如果 API 调用失败，直接提醒用户"数据获取失败"，**不要**尝试从联网搜索或其他渠道获取数据
 - 返回数据仅供参考，不作为投资建议。

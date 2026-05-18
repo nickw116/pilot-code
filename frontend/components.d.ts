@@ -11,12 +11,14 @@ export {}
 /* prettier-ignore */
 declare module 'vue' {
   export interface GlobalComponents {
+    AcpLogPanel: typeof import('./src/components/AcpLogPanel.vue')['default']
     MessageBubble: typeof import('./src/components/MessageBubble.vue')['default']
     MessageInput: typeof import('./src/components/MessageInput.vue')['default']
     MessageList: typeof import('./src/components/MessageList.vue')['default']
     RouterLink: typeof import('vue-router')['RouterLink']
     RouterView: typeof import('vue-router')['RouterView']
     SessionList: typeof import('./src/components/SessionList.vue')['default']
+    SessionMonitor: typeof import('./src/components/SessionMonitor.vue')['default']
     SettingsPopup: typeof import('./src/components/SettingsPopup.vue')['default']
     VanActionSheet: typeof import('vant/es')['ActionSheet']
     VanButton: typeof import('vant/es')['Button']
@@ -24,6 +26,7 @@ declare module 'vue' {
     VanCellGroup: typeof import('vant/es')['CellGroup']
     VanField: typeof import('vant/es')['Field']
     VanIcon: typeof import('vant/es')['Icon']
+    VanLoading: typeof import('vant/es')['Loading']
     VanNavBar: typeof import('vant/es')['NavBar']
     VanPopup: typeof import('vant/es')['Popup']
   }

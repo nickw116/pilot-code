@@ -1,5 +1,5 @@
-export const API_BASE = '/pilotCode/api'
-export const TOKEN_KEY = 'pilot-code-token'
+export const API_BASE = '/pilotAgent/api'
+export const TOKEN_KEY = 'pilot-agent-token'
 
 // Filtered message content (skip these in history)
 export const FILTERED_MESSAGES = ['NO_REPLY', 'HEARTBEAT_OK']
@@ -26,7 +26,8 @@ export const API_MODELS = '/models'
 export const API_MODEL_SWITCH = '/model/switch'
 export const API_AGENTS = '/agents'
 export const API_STT = '/stt'
+export const API_ADMIN_SESSIONS = '/admin/sessions'
 
 // Session
 export const SESSION_PREFIX = 'agent:main:h5'
-export const SESSION_KEY = 'pilot-code-session-key'
+export const SESSION_KEY = 'pilot-agent-session-key'

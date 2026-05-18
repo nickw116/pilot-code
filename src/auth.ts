@@ -1,8 +1,9 @@
 import Database from "better-sqlite3";
 import crypto from "crypto";
+import fs from "fs";
 import path from "path";
 
-const DB_PATH = process.env.USER_DB_PATH || path.join(import.meta.dirname, "..", "h5-chat", "bridge", "users.db");
+const DB_PATH = process.env.USER_DB_PATH || path.join(process.cwd(), "data", "db", "users.db");
 
 let db: Database.Database;
 
@@ -18,6 +19,9 @@ function ensureUserColumns(d: Database.Database) {
   const cols = (d.pragma("table_info(users)") as { name: string }[]).map(c => c.name);
   if (!cols.includes("allowed_agent")) {
     d.exec("ALTER TABLE users ADD COLUMN allowed_agent TEXT DEFAULT 'main'");
+  }
+  if (!cols.includes("preferred_agent")) {
+    d.exec("ALTER TABLE users ADD COLUMN preferred_agent TEXT DEFAULT NULL");
   }
 }
 
@@ -38,6 +42,7 @@ export interface User {
   display_name: string;
   enabled: number;
   allowed_agent: string | null;
+  preferred_agent: string | null;
 }
 
 function hashPassword(password: string): string {
@@ -47,7 +52,7 @@ function hashPassword(password: string): string {
 export function login(
   username: string,
   password: string
-): { token: string; username: string; role: string; display_name: string; allowed_agent: string } | null {
+): { token: string; username: string; role: string; display_name: string; allowed_agent: string; preferred_agent: string | null } | null {
   const d = getDb();
   const user = d
     .prepare("SELECT * FROM users WHERE username = ? AND enabled = 1")
@@ -68,6 +73,7 @@ export function login(
     role: user.role,
     display_name: user.display_name,
     allowed_agent: user.allowed_agent || "user",
+    preferred_agent: user.preferred_agent,
   };
 }
 
@@ -77,13 +83,14 @@ export interface TokenUser {
   role: string;
   displayName: string;
   allowedAgent: string;
+  preferredAgent: string | null;
 }
 
 export function validateToken(token: string): TokenUser | null {
   const d = getDb();
   const row = d
     .prepare(
-      `SELECT t.user_id, u.username, u.role, u.display_name, u.enabled, u.allowed_agent
+      `SELECT t.user_id, u.username, u.role, u.display_name, u.enabled, u.allowed_agent, u.preferred_agent
        FROM tokens t JOIN users u ON t.user_id = u.id
        WHERE t.token = ? AND u.enabled = 1`
     )
@@ -95,6 +102,7 @@ export function validateToken(token: string): TokenUser | null {
     role: row.role,
     displayName: row.display_name,
     allowedAgent: row.allowed_agent || "user",
+    preferredAgent: row.preferred_agent,
   };
 }
 
@@ -117,4 +125,8 @@ export function changePassword(
   // Revoke all tokens for this user
   d.prepare("DELETE FROM tokens WHERE user_id = ?").run(userId);
   return { ok: true };
+}
+
+export function setPreferredAgent(userId: number, agentId: string): void {
+  getDb().prepare("UPDATE users SET preferred_agent = ? WHERE id = ?").run(agentId, userId);
 }

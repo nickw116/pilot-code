@@ -97,10 +97,28 @@ export function useSend(ctx, streamingApi) {
 
   /* --- History --- */
 
+  function handleSessionStatus(statusInfo) {
+    if (statusInfo.status === 'generating') {
+      ctx.loading.value = true
+      if (statusInfo.runId) {
+        ctx.state.currentRunId = statusInfo.runId
+      }
+      console.debug('[useChat] restored generating state from server, runId:', statusInfo.runId)
+    } else if (statusInfo.status === 'interrupted') {
+      ctx.loading.value = false
+      console.warn('[useChat] last session was interrupted')
+    } else if (statusInfo.status === 'error') {
+      ctx.loading.value = false
+      console.warn('[useChat] last session ended with error:', statusInfo.error)
+    } else {
+      ctx.loading.value = false
+    }
+  }
+
   async function loadHistory() {
     historyLoading.value = true
     try {
-      const params = new URLSearchParams({ sessionKey: ctx.sessionKey.value, limit: '50' })
+      const params = new URLSearchParams({ sessionKey: ctx.sessionKey.value, limit: '200' })
       const r = await fetch(
         `${API_BASE}${API_HISTORY}?${params}`,
         { headers: { Authorization: `Bearer ${ctx.token.value}` } }
@@ -113,6 +131,10 @@ export function useSend(ctx, streamingApi) {
       const entries = data.entries || data.messages || []
       console.debug('[useChat] history entries:', entries.length)
 
+      if (data.status) {
+        handleSessionStatus(data.status)
+      }
+
       const historyMessages = entries
         .map((e) => ({ entry: e, role: normalizeHistoryRole(e) }))
         .filter(({ role }) => role === 'user' || role === 'assistant')
@@ -120,42 +142,36 @@ export function useSend(ctx, streamingApi) {
           const t = extractText(entry).trim()
           return t && !FILTERED_MESSAGES.includes(t)
         })
-        .map(({ entry, role }, i) => {
+        .map(({ entry, role }) => {
           const content = extractText(entry)
+          const acpLogs = Array.isArray(entry.acpLogs) && entry.acpLogs.length > 0
+            ? entry.acpLogs
+            : undefined
           return {
-            id: i,
+            id: entry.id || entry.runId || Date.now() + Math.random(),
             role,
             content,
+            runId: entry.runId || entry.run_id || null,
             files: [],
             media: role === 'assistant' ? detectMediaUrls(content, ctx.token.value) : createEmptyMedia(),
             steps: [],
+            acpLogs: acpLogs || [],
           }
         })
 
       console.debug('[useChat] filtered messages:', historyMessages.length)
 
-      // Dedup: keep in-memory messages that are still streaming or have runIds
-      // not present in history (i.e. messages that were added after the history snapshot).
-      // This prevents losing active streaming state and avoids duplicates.
       const historyRunIds = new Set(historyMessages.map(m => m.runId).filter(Boolean))
-      const historyContents = new Set(historyMessages.map(m => (m.content || '').trim()).filter(Boolean))
-      const preservedMessages = messages.value.filter((m) => {
-        // Always keep streaming messages
-        if (m.isStreaming) return true
-        // Keep messages whose content or runId is NOT already in history
-        if (m.runId && !historyRunIds.has(m.runId)) return true
-        const trimmed = (m.content || '').trim()
-        if (trimmed && !historyContents.has(trimmed)) return true
-        return false
+
+      const streamingMessages = messages.value.filter((m) => m.isStreaming)
+
+      const preservedMessages = streamingMessages.filter((m) => {
+        if (m.runId && historyRunIds.has(m.runId)) return false
+        return true
       })
 
-      // Merge: history first, then preserved messages appended at the end
-      // (preserved messages are newer than history)
       const finalMessages = [...historyMessages]
       for (const pm of preservedMessages) {
-        // Skip if already present in history by content
-        const trimmed = (pm.content || '').trim()
-        if (trimmed && historyContents.has(trimmed)) continue
         if (pm.runId && historyRunIds.has(pm.runId)) continue
         finalMessages.push(pm)
       }
@@ -394,6 +410,8 @@ export function useSend(ctx, streamingApi) {
 
       let fullMessage = ''
       const sendImages = []
+      const sendVideos = []
+      const sendAudios = []
       if (hasAttachments) {
         const parts = attachments.value.map(a => {
           if (a.textContent) {
@@ -403,8 +421,17 @@ export function useSend(ctx, streamingApi) {
             const dataUrl = a.preview
             const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/)
             if (match) {
-              sendImages.push({ data: match[2], mimeType: match[1] })
+              if (match[1].startsWith('video/')) {
+                sendVideos.push({ data: match[2], mimeType: match[1] })
+              } else if (match[1].startsWith('audio/')) {
+                sendAudios.push({ data: match[2], mimeType: match[1] })
+              } else {
+                sendImages.push({ data: match[2], mimeType: match[1] })
+              }
             }
+            const mime = match?.[1] || ''
+            if (mime.startsWith('video/')) return `[视频: ${a.name}]`
+            if (mime.startsWith('audio/')) return `[音频: ${a.name}]`
             return `[图片: ${a.name}]`
           }
           return `[文件: ${a.name}] (${a.type || 'unknown'}, ${(a.size ? formatFileSize(a.size) : 'size unknown')})`
@@ -439,6 +466,8 @@ export function useSend(ctx, streamingApi) {
               message: fullMessage,
               session_key: ctx.sessionKey.value,
               images: sendImages.length > 0 ? sendImages : undefined,
+              videos: sendVideos.length > 0 ? sendVideos : undefined,
+              audios: sendAudios.length > 0 ? sendAudios : undefined,
             }),
           })
           if (!resp.ok) {

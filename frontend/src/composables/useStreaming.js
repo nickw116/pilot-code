@@ -354,7 +354,7 @@ export function useStreaming(ctx) {
     if (ctx.state.aiMsg) ctx.state.aiMsg.isStreaming = false
     // Clean up empty assistant messages
     const lastMsg = messages.value[messages.value.length - 1]
-    if (lastMsg?.role === 'assistant' && !lastMsg.content?.trim() && !lastMsg.steps?.length) {
+    if (lastMsg?.role === 'assistant' && !lastMsg.content?.trim() && !lastMsg.steps?.length && !lastMsg.acpLogs?.length) {
       messages.value.pop()
     }
     ctx.scrollToBottom()
@@ -370,7 +370,7 @@ export function useStreaming(ctx) {
     ctx.state.currentRunId = null
     // Clean up empty assistant messages
     const lastMsg = messages.value[messages.value.length - 1]
-    if (lastMsg?.role === 'assistant' && !lastMsg.content?.trim() && !lastMsg.steps?.length) {
+    if (lastMsg?.role === 'assistant' && !lastMsg.content?.trim() && !lastMsg.steps?.length && !lastMsg.acpLogs?.length) {
       messages.value.pop()
     }
     ctx.state.aiMsg = null

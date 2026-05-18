@@ -1,10 +1,7 @@
 import Database from "better-sqlite3";
-import crypto from "crypto";
-import fs from "fs";
 import path from "path";
 
-const DB_PATH = process.env.USER_DB_PATH || path.join(import.meta.dirname, "..", "h5-chat", "bridge", "users.db");
-const SESSIONS_DIR = process.env.SESSIONS_DIR || path.join(import.meta.dirname, "..", "data", "sessions");
+const DB_PATH = process.env.USER_DB_PATH || path.join(process.cwd(), "data", "db", "users.db");
 
 let db: Database.Database;
 
@@ -12,7 +9,45 @@ function getDb(): Database.Database {
   if (db) return db;
   db = new Database(DB_PATH, { readonly: false });
   db.pragma("journal_mode = WAL");
+  ensureTables(db);
   return db;
+}
+
+function ensureTables(d: Database.Database) {
+  d.exec(`
+    CREATE TABLE IF NOT EXISTS messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_key TEXT NOT NULL,
+      role TEXT NOT NULL,
+      content TEXT NOT NULL,
+      model TEXT,
+      run_id TEXT,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_key, id);
+
+    CREATE TABLE IF NOT EXISTS session_status (
+      session_key TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      run_id TEXT,
+      error TEXT,
+      updated_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS acp_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_key TEXT NOT NULL,
+      run_id TEXT NOT NULL,
+      log_type TEXT NOT NULL,
+      tool TEXT,
+      text TEXT,
+      detail TEXT,
+      duration_ms INTEGER,
+      seq INTEGER NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_acp_logs_run ON acp_logs(session_key, run_id, seq);
+  `);
 }
 
 export interface Session {
@@ -26,19 +61,16 @@ export interface Session {
   active: number;
 }
 
-/** Generate a session key: agent:<agentId>:h5-<username>-<timestamp> */
 function makeSessionKey(userId: number, username: string, agentId: string): string {
   const ts = new Date().toISOString().replace(/[-:T]/g, "").slice(0, 15).replace(/(\d{8})(\d{6})/, "$1-$2");
   return `agent:${agentId}:h5-${username}-${ts}`;
 }
 
-/** Create a new session for a user */
 export function createSession(userId: number, username: string, agentId = "main"): Session {
   const d = getDb();
   const sessionKey = makeSessionKey(userId, username, agentId);
   const now = Date.now() / 1000;
 
-  // Deactivate previous active sessions for this user+agent
   d.prepare("UPDATE sessions SET active = 0 WHERE user_id = ? AND agent_id = ? AND active = 1")
     .run(userId, agentId);
 
@@ -58,7 +90,6 @@ export function createSession(userId: number, username: string, agentId = "main"
   };
 }
 
-/** Get the active session for a user+agent, or create one */
 export function getOrCreateActiveSession(userId: number, username: string, agentId = "main"): Session {
   const d = getDb();
   const row = d
@@ -68,7 +99,6 @@ export function getOrCreateActiveSession(userId: number, username: string, agent
   return createSession(userId, username, agentId);
 }
 
-/** List sessions for a user, optionally filtered by agentId */
 export function listSessions(userId: number, agentId?: string): Session[] {
   if (agentId) {
     return getDb()
@@ -80,7 +110,23 @@ export function listSessions(userId: number, agentId?: string): Session[] {
     .all(userId) as Session[];
 }
 
-/** Switch active session */
+export interface AllSessionRow extends Session {
+  username: string;
+  display_name: string;
+}
+
+export function listAllSessions(agentId?: string): AllSessionRow[] {
+  const d = getDb();
+  if (agentId) {
+    return d.prepare(
+      `SELECT s.*, u.username, u.display_name FROM sessions s JOIN users u ON s.user_id = u.id WHERE s.agent_id = ? ORDER BY s.updated_at DESC`
+    ).all(agentId) as AllSessionRow[];
+  }
+  return d.prepare(
+    `SELECT s.*, u.username, u.display_name FROM sessions s JOIN users u ON s.user_id = u.id ORDER BY s.updated_at DESC`
+  ).all() as AllSessionRow[];
+}
+
 export function switchSession(userId: number, sessionKey: string): Session | null {
   const d = getDb();
   const session = d
@@ -88,81 +134,134 @@ export function switchSession(userId: number, sessionKey: string): Session | nul
     .get(userId, sessionKey) as Session | undefined;
   if (!session) return null;
 
-  // Deactivate all, activate this one
   d.prepare("UPDATE sessions SET active = 0 WHERE user_id = ?").run(userId);
-  d.prepare("UPDATE sessions SET active = 1, updated_at = ? WHERE id = ?")
-    .run(Date.now() / 1000, session.id);
+  d.prepare("UPDATE sessions SET active = 1 WHERE id = ?")
+    .run(session.id);
   return { ...session, active: 1 };
 }
 
-/** Delete a session */
 export function deleteSession(userId: number, sessionKey: string): boolean {
   const d = getDb();
   const result = d
     .prepare("DELETE FROM sessions WHERE user_id = ? AND session_key = ?")
     .run(userId, sessionKey);
-  // Also delete the JSONL file
-  const jsonlPath = path.join(SESSIONS_DIR, `${sessionKey}.jsonl`);
-  try { fs.unlinkSync(jsonlPath); } catch {}
+  d.prepare("DELETE FROM messages WHERE session_key = ?").run(sessionKey);
+  d.prepare("DELETE FROM session_status WHERE session_key = ?").run(sessionKey);
+  d.prepare("DELETE FROM acp_logs WHERE session_key = ?").run(sessionKey);
   return result.changes > 0;
 }
 
-// --- JSONL context persistence ---
+// --- Session status (state machine) ---
+
+export type SessionStatus = "idle" | "generating" | "completed" | "interrupted" | "error";
+
+export interface SessionStatusInfo {
+  status: SessionStatus;
+  runId: string | null;
+  error: string | null;
+  updatedAt: number;
+}
+
+export function setSessionStatus(sessionKey: string, status: SessionStatus, extra?: { runId?: string; error?: string }): void {
+  const d = getDb();
+  const now = Date.now();
+  const runId = extra?.runId || null;
+  const error = extra?.error || null;
+  d.prepare(`
+    INSERT INTO session_status (session_key, status, run_id, error, updated_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(session_key) DO UPDATE SET status = excluded.status, run_id = excluded.run_id, error = excluded.error, updated_at = excluded.updated_at
+  `).run(sessionKey, status, runId, error, now);
+}
+
+export function getSessionStatus(sessionKey: string): SessionStatusInfo | null {
+  const d = getDb();
+  const row = d.prepare("SELECT status, run_id as runId, error, updated_at as updatedAt FROM session_status WHERE session_key = ?")
+    .get(sessionKey) as SessionStatusInfo | undefined;
+  return row || null;
+}
+
+export function cleanInterruptedSessions(): number {
+  const d = getDb();
+  const result = d.prepare(
+    "UPDATE session_status SET status = 'interrupted', error = '服务重启，生成被中断' WHERE status = 'generating'"
+  ).run();
+  return result.changes;
+}
+
+// --- Message persistence (SQLite, replaces JSONL) ---
 
 export interface ContextMessage {
   role: "user" | "assistant";
   content: string;
   model?: string;
+  runId?: string;
+  dbId?: number;
   timestamp?: number;
 }
 
-/** Load context from JSONL file */
-export function loadContext(sessionKey: string): ContextMessage[] {
-  const filePath = path.join(SESSIONS_DIR, `${sessionKey}.jsonl`);
-  if (!fs.existsSync(filePath)) return [];
-
-  const lines = fs.readFileSync(filePath, "utf-8").split("\n").filter(Boolean);
-  const messages: ContextMessage[] = [];
-  for (const line of lines) {
-    try {
-      const entry = JSON.parse(line);
-      if (entry.type === "message") {
-        messages.push(entry.data);
-      }
-    } catch {}
-  }
-  return messages;
+export function loadContext(sessionKey: string, limit = 200): ContextMessage[] {
+  const d = getDb();
+  const count = d.prepare("SELECT COUNT(*) as cnt FROM messages WHERE session_key = ?").get(sessionKey) as { cnt: number };
+  const offset = Math.max(0, count.cnt - limit);
+  return d.prepare(
+    "SELECT id as dbId, role, content, model, run_id as runId, created_at as timestamp FROM messages WHERE session_key = ? ORDER BY id ASC LIMIT ? OFFSET ?"
+  ).all(sessionKey, limit, offset) as ContextMessage[];
 }
 
-/** Save new messages to JSONL (append-only) */
-export function appendContext(sessionKey: string, messages: ContextMessage[]): void {
-  fs.mkdirSync(SESSIONS_DIR, { recursive: true });
-  const filePath = path.join(SESSIONS_DIR, `${sessionKey}.jsonl`);
-  const stream = fs.createWriteStream(filePath, { flags: "a" });
-  const now = Date.now();
+export function appendContext(sessionKey: string, messages: ContextMessage[], runId?: string): void {
+  const d = getDb();
+  const insert = d.prepare(
+    "INSERT INTO messages (session_key, role, content, model, run_id, created_at) VALUES (?, ?, ?, ?, ?, ?)"
+  );
+  d.transaction(() => {
+    for (const msg of messages) {
+      const ts = msg.timestamp || Date.now();
+      insert.run(sessionKey, msg.role, msg.content, msg.model || null, runId || null, ts);
+    }
+  })();
 
-  for (const msg of messages) {
-    const entry = {
-      id: crypto.randomUUID(),
-      timestamp: now,
-      type: "message",
-      data: { ...msg, timestamp: now },
-    };
-    stream.write(JSON.stringify(entry) + "\n");
-  }
-  stream.end();
-
-  // Update session timestamp
   try {
-    getDb().prepare("UPDATE sessions SET updated_at = ? WHERE session_key = ?")
-      .run(now / 1000, sessionKey);
+    d.prepare("UPDATE sessions SET updated_at = ? WHERE session_key = ?")
+      .run(Date.now() / 1000, sessionKey);
   } catch {}
 }
 
-/** Update session title */
 export function updateSessionTitle(sessionKey: string, title: string): void {
   try {
     getDb().prepare("UPDATE sessions SET title = ? WHERE session_key = ? AND title = ''")
       .run(title, sessionKey);
+  } catch {}
+}
+
+// --- ACP log persistence ---
+
+export interface AcpLogRow {
+  logType: string;
+  tool: string | null;
+  text: string | null;
+  detail: string | null;
+  durationMs: number | null;
+  seq: number;
+  createdAt: number;
+}
+
+export function appendAcpLog(sessionKey: string, runId: string, log: { type: string; tool?: string | null; text?: string; detail?: string | null; durationMs?: number | null }, seq: number): void {
+  const d = getDb();
+  d.prepare(
+    "INSERT INTO acp_logs (session_key, run_id, log_type, tool, text, detail, duration_ms, seq, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  ).run(sessionKey, runId, log.type, log.tool ?? null, log.text ?? null, log.detail ?? null, log.durationMs ?? null, seq, Date.now());
+}
+
+export function loadAcpLogs(sessionKey: string, runId: string): AcpLogRow[] {
+  const d = getDb();
+  return d.prepare(
+    "SELECT log_type as logType, tool, text, detail, duration_ms as durationMs, seq, created_at as createdAt FROM acp_logs WHERE session_key = ? AND run_id = ? ORDER BY seq ASC"
+  ).all(sessionKey, runId) as AcpLogRow[];
+}
+
+export function deleteAcpLogs(sessionKey: string): void {
+  try {
+    getDb().prepare("DELETE FROM acp_logs WHERE session_key = ?").run(sessionKey);
   } catch {}
 }

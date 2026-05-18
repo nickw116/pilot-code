@@ -38,7 +38,7 @@ export function useAuth() {
       })
       if (r.ok) {
         const data = await r.json()
-        currentUser.value = { username: data.user, role: data.role, allowedAgent: data.allowed_agent }
+        currentUser.value = { username: data.user, role: data.role, allowedAgent: data.allowed_agent, preferredAgent: data.preferred_agent }
         loggedIn.value = true
         await fetchSessionKey()
         return true
@@ -75,7 +75,7 @@ export function useAuth() {
       if (r.ok) {
         const data = await r.json()
         token.value = data.token
-        currentUser.value = { username: data.username, role: data.role, allowedAgent: data.allowed_agent }
+        currentUser.value = { username: data.username, role: data.role, allowedAgent: data.allowed_agent, preferredAgent: data.preferred_agent }
         sessionStorage.setItem(TOKEN_KEY, data.token)
         await fetchSessionKey()
         loggedIn.value = true

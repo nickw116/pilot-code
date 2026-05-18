@@ -55,9 +55,12 @@ function createSummaryMessage(oldMessages: AgentMessage[]): AgentMessage {
 /**
  * Transform context before each LLM call.
  * If total tokens exceed MAX_CONTEXT_TOKENS, compress older messages.
+ * When compaction happens, onCompact callback is invoked with the old messages
+ * so callers can save them to persistent memory before they are lost.
  */
 export async function compactIfNeeded(
-  messages: AgentMessage[]
+  messages: AgentMessage[],
+  onCompact?: (oldMessages: AgentMessage[]) => void
 ): Promise<AgentMessage[]> {
   const totalTokens = countMessageTokens(messages);
 
@@ -78,6 +81,13 @@ export async function compactIfNeeded(
   const cutoff = bodyMsgs.length - KEEP_RECENT_MESSAGES;
   const oldMessages = bodyMsgs.slice(0, cutoff);
   const recentMessages = bodyMsgs.slice(cutoff);
+
+  // Notify caller so it can flush old messages to persistent memory
+  if (onCompact) {
+    try { onCompact(oldMessages); } catch (err) {
+      console.error("[memory] compaction flush callback failed:", err);
+    }
+  }
 
   const summary = createSummaryMessage(oldMessages);
   const compacted = [...systemMsgs, summary, ...recentMessages];

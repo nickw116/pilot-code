@@ -1,5 +1,5 @@
 import { ref } from 'vue'
-import { useMessages } from './useMessages.js'
+import { useMessages, syncMessageMediaFromContent } from './useMessages.js'
 import { useStreaming } from './useStreaming.js'
 import { useSend, formatFileSize, fileIcon, isSameSessionKey } from './useSend.js'
 
@@ -96,6 +96,17 @@ export function useChat(token, currentUser, sessionKey, options = {}) {
       return
     }
 
+    if (kind === 'assistant.thinking') {
+      const delta = payload.delta || payload.text
+      if (!delta) return
+      const aiMsg = messagesApi.ensureCurrentAssistant()
+      aiMsg.isStreaming = true
+      loading.value = true
+      messagesApi.applyThinkingDelta(delta)
+      scrollToBottom()
+      return
+    }
+
     if (kind === 'command.output') {
       const aiMsg = ctx.state.aiMsg
       if (!aiMsg) return
@@ -119,6 +130,63 @@ export function useChat(token, currentUser, sessionKey, options = {}) {
         name: payload.name || 'tool',
         input: payload.input,
         status: 'running',
+      })
+      scrollToBottom()
+      return
+    }
+
+    if (kind === 'acp.log_event') {
+      const aiMsg = ctx.state.aiMsg
+      if (!aiMsg) return
+      if (!aiMsg.acpLogs) aiMsg.acpLogs = []
+
+      if (payload.type === 'text_delta') {
+        aiMsg.acpStatus = 'responding'
+        if (payload.text) {
+          aiMsg.content = (aiMsg.content || '') + payload.text
+          syncMessageMediaFromContent(aiMsg, ctx.token.value)
+        }
+        const last = aiMsg.acpLogs[aiMsg.acpLogs.length - 1]
+        if (last && last.type === 'text_delta') {
+          last.text = (last.text || '') + (payload.text || '')
+        } else {
+          aiMsg.acpLogs.push({
+            type: payload.type,
+            tool: payload.tool,
+            text: payload.text,
+            detail: payload.detail,
+            durationMs: payload.durationMs,
+            ts: Date.now(),
+          })
+        }
+        scrollToBottom()
+        return
+      }
+      if (payload.type === 'reasoning') {
+        aiMsg.acpStatus = 'thinking'
+        const last = aiMsg.acpLogs[aiMsg.acpLogs.length - 1]
+        if (last && last.type === 'reasoning') {
+          last.text = (last.text || '') + (payload.text || '')
+        } else {
+          aiMsg.acpLogs.push({
+            type: payload.type,
+            tool: payload.tool,
+            text: payload.text,
+            detail: payload.detail,
+            durationMs: payload.durationMs,
+            ts: Date.now(),
+          })
+        }
+        scrollToBottom()
+        return
+      }
+      aiMsg.acpLogs.push({
+        type: payload.type,
+        tool: payload.tool,
+        text: payload.text,
+        detail: payload.detail,
+        durationMs: payload.durationMs,
+        ts: Date.now(),
       })
       scrollToBottom()
       return

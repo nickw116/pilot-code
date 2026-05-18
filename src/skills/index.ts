@@ -16,7 +16,7 @@ export interface Skill {
   references: string[];
 }
 
-const SKILLS_DIR = import.meta.dirname;
+const SKILLS_DIR = path.join(process.cwd(), "src", "skills");
 
 function parseFrontmatter(raw: string): { meta: SkillMeta; body: string } {
   const meta: SkillMeta = {

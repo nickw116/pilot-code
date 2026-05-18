@@ -130,37 +130,62 @@ async function startVoice() {
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
     audioChunks = []
-    mediaRecorder = new MediaRecorder(stream)
+
+    const options = {}
+    if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+      options.mimeType = 'audio/webm;codecs=opus'
+    } else if (MediaRecorder.isTypeSupported('audio/webm')) {
+      options.mimeType = 'audio/webm'
+    } else if (MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')) {
+      options.mimeType = 'audio/ogg;codecs=opus'
+    } else if (MediaRecorder.isTypeSupported('audio/mp4')) {
+      options.mimeType = 'audio/mp4'
+    }
+
+    mediaRecorder = new MediaRecorder(stream, options)
     mediaRecorder.ondataavailable = (e) => {
-      if (e.data.size > 0) audioChunks.push(e.data)
+      if (e.data && e.data.size > 0) audioChunks.push(e.data)
+    }
+    mediaRecorder.onerror = (e) => {
+      console.error('[voice] recorder error:', e)
+      stream.getTracks().forEach(t => t.stop())
+      voiceRecording.value = false
+      showNotify({ type: 'warning', message: '录音出错，请重试' })
     }
     mediaRecorder.onstop = () => {
       stream.getTracks().forEach(t => t.stop())
       voiceRecording.value = false
       if (audioChunks.length > 0) {
         sendVoiceToServer()
+      } else {
+        showNotify({ type: 'warning', message: '未录到音频，请重试' })
       }
     }
-    mediaRecorder.start()
+    mediaRecorder.start(1000)
     voiceRecording.value = true
   } catch (e) {
-    console.warn('[voice] start failed:', e)
-    showNotify({ type: 'warning', message: '无法启动录音，请允许麦克风权限' })
+    console.error('[voice] start failed:', e)
+    const msg = e?.name === 'NotAllowedError' ? '请允许麦克风权限后重试'
+      : e?.name === 'NotFoundError' ? '未找到麦克风设备'
+      : `录音启动失败: ${e?.message || e}`
+    showNotify({ type: 'warning', message: msg })
   }
 }
 
 function stopVoice() {
-  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+  if (mediaRecorder && mediaRecorder.state === 'recording') {
     mediaRecorder.stop()
   }
 }
 
 async function sendVoiceToServer() {
-  const mimeType = audioChunks[0]?.type || 'audio/webm'
+  const mimeType = mediaRecorder?.mimeType || audioChunks[0]?.type || 'audio/webm'
   const blob = new Blob(audioChunks, { type: mimeType })
   audioChunks = []
 
-  if (blob.size < 500) {
+  console.log('[voice] sending audio:', blob.size, 'bytes, type:', mimeType)
+
+  if (blob.size < 100) {
     showNotify({ type: 'warning', message: '录音时间太短，请重试' })
     return
   }
@@ -168,9 +193,10 @@ async function sendVoiceToServer() {
   voiceProcessing.value = true
   try {
     const formData = new FormData()
-    formData.append('audio', blob, `voice_${Date.now()}.webm`)
+    const ext = mimeType.includes('ogg') ? 'ogg' : mimeType.includes('mp4') ? 'mp4' : 'webm'
+    formData.append('audio', blob, `voice_${Date.now()}.${ext}`)
 
-    const token = localStorage.getItem(TOKEN_KEY)
+    const token = sessionStorage.getItem(TOKEN_KEY)
     const resp = await fetch(`${API_BASE}/stt`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}` },
@@ -178,7 +204,8 @@ async function sendVoiceToServer() {
     })
     if (!resp.ok) {
       const err = await resp.text()
-      throw new Error(err || `HTTP ${resp.status}`)
+      console.error('[voice] stt HTTP error:', resp.status, err)
+      throw new Error(`HTTP ${resp.status}`)
     }
     const data = await resp.json()
     const text = data.text || ''

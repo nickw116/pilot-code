@@ -3,12 +3,20 @@
     <van-nav-bar fixed placeholder class="nav-bar">
       <template #left>
         <div class="nav-left-actions">
-          <van-icon name="bars" class="nav-menu-icon" @click="$emit('open-sessions')" />
+          <div
+            v-if="props.canAccessMonitor"
+            class="nav-btn-wrapper nav-monitor-btn"
+            @click="$emit('open-monitor')"
+            title="全部会话"
+          >
+            <van-icon name="bars" class="nav-action-icon" />
+          </div>
         </div>
       </template>
       <template #title>
         <div class="nav-title-wrap">
-          <span class="nav-title">PILOT CODE</span>
+          <span v-if="props.monitorMode" class="nav-title nav-title--monitor">MONITOR</span>
+          <span v-else class="nav-title">PILOT AGENT</span>
           <div class="nav-sub-row">
             <button
               v-if="props.currentModel"
@@ -24,8 +32,10 @@
       </template>
       <template #right>
         <div class="nav-right-actions">
-          <div class="nav-btn-wrapper" @click="reloadPage">
-            <van-icon name="replay" class="nav-action-icon nav-action-icon--refresh" />
+          <div class="nav-btn-wrapper" @click="reloadPage" :class="{ 'is-loading': refreshing }">
+            <van-icon :name="refreshing ? '' : 'replay'" class="nav-action-icon nav-action-icon--refresh">
+              <template v-if="refreshing"><van-loading type="spinner" size="18" color="currentColor" /></template>
+            </van-icon>
           </div>
           <div class="nav-btn-wrapper" @click="$emit('open-settings')">
             <van-icon name="setting-o" class="nav-action-icon nav-action-icon--setting" />
@@ -47,15 +57,20 @@
     </transition>
 
     <!-- 历史消息加载中 -->
-    <div v-if="props.historyLoading && props.messages.length === 0" class="history-loading">
+    <div v-if="(props.monitorMode ? props.monitorHistoryLoading : props.historyLoading) && (props.monitorMode ? props.monitorMessages : props.messages).length === 0" class="history-loading">
       <div class="history-loading__spinner">
         <div class="history-loading__ring"></div>
       </div>
       <div class="history-loading__text">加载历史消息…</div>
     </div>
 
+    <!-- Monitor mode read-only banner -->
+    <div v-else-if="props.monitorMode && props.monitorMessages.length === 0" class="empty-state">
+      <div class="empty-greeting">暂无消息</div>
+    </div>
+
     <!-- 空会话引导区 -->
-    <div v-else-if="props.messages.length === 0" class="empty-state">
+    <div v-else-if="!props.monitorMode && props.messages.length === 0" class="empty-state">
       <div class="empty-greeting">有什么我能帮你的吗？</div>
       <div class="empty-cards">
         <button
@@ -73,16 +88,31 @@
     <MessageList
       v-else
       ref="messageListRef"
-      :messages="props.messages"
-      :loading="props.loading"
+      :messages="props.monitorMode ? props.monitorMessages : props.messages"
+      :loading="props.monitorMode ? false : props.loading"
       :format-file-size="props.formatFileSize"
       :file-icon="props.fileIcon"
       :acp-logs="props.acpLogs"
       :acp-status="props.acpStatus"
+      :current-agent-id="props.currentAgentId"
       @load-more="emit('load-more')"
     />
 
+    <!-- Monitor mode: read-only banner -->
+    <div v-if="props.monitorMode" class="monitor-banner">
+      <span class="monitor-banner__info">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+          <circle cx="12" cy="12" r="3"/>
+        </svg>
+        只读查看: {{ props.monitorUserInfo }}
+      </span>
+      <van-button size="small" type="primary" class="monitor-exit-btn" @click="$emit('exit-monitor')">退出</van-button>
+    </div>
+
+    <!-- Normal mode: message input -->
     <MessageInput
+      v-else
       v-model="inputText"
       :loading="loading"
       :uploading="uploading"
@@ -131,9 +161,15 @@ const props = defineProps({
   acpBridge: { type: Object, default: () => null },
   models: { type: Array, default: () => [] },
   sessionKey: { type: String, default: '' },
+  currentAgentId: { type: String, default: 'main' },
+  monitorMode: { type: Boolean, default: false },
+  monitorMessages: { type: Array, default: () => [] },
+  monitorHistoryLoading: { type: Boolean, default: false },
+  monitorUserInfo: { type: String, default: '' },
+  canAccessMonitor: { type: Boolean, default: false },
 })
 
-const emit = defineEmits(['update:inputText', 'send', 'abort', 'upload', 'remove-attachment', 'open-settings', 'open-sessions', 'hot-refresh', 'switch-model', 'load-more'])
+const emit = defineEmits(['update:inputText', 'send', 'abort', 'upload', 'remove-attachment', 'open-settings', 'hot-refresh', 'switch-model', 'load-more', 'open-monitor', 'exit-monitor'])
 
 // ── 模型选择器 ──
 const modelPickerVisible = ref(false)
@@ -190,8 +226,13 @@ function abort() {
   emit('abort')
 }
 
+const refreshing = ref(false)
+
 function reloadPage() {
+  if (refreshing.value) return
+  refreshing.value = true
   emit('hot-refresh')
+  setTimeout(() => { refreshing.value = false }, 1500)
 }
 
 const suggestionCards = [
@@ -371,6 +412,14 @@ function fillSuggestion(text) {
   transform: scale(0.9) rotate(-60deg);
   color: var(--primary);
 }
+.nav-btn-wrapper.is-loading .nav-action-icon--refresh {
+  animation: spin 0.8s linear infinite;
+  pointer-events: none;
+}
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
 .nav-btn-wrapper:active .nav-action-icon--setting {
   transform: scale(0.9) rotate(45deg);
   color: var(--primary);
@@ -519,5 +568,47 @@ function fillSuggestion(text) {
 }
 .empty-card-text {
   flex: 1;
+}
+
+/* ── Monitor Nav Button ── */
+.nav-monitor-btn {
+  margin-left: 2px;
+}
+.nav-monitor-btn:active svg {
+  color: var(--primary);
+  transform: scale(0.9);
+}
+.nav-title--monitor {
+  color: #F59E0B;
+  letter-spacing: 1px;
+}
+
+/* ── Monitor Read-only Banner ── */
+.monitor-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 16px;
+  background: linear-gradient(135deg, rgba(245, 158, 11, 0.08), rgba(245, 158, 11, 0.15));
+  border-top: 1px solid rgba(245, 158, 11, 0.2);
+  gap: 10px;
+}
+.monitor-banner__info {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: #92400E;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 1;
+}
+.monitor-exit-btn.van-button {
+  flex-shrink: 0;
+  border-radius: 8px;
+  height: 28px;
+  font-size: 12px;
+  font-weight: 600;
 }
 </style>

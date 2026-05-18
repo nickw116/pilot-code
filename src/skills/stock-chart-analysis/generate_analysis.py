@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-金融技术分析图生成器 —— 缠论 + 道氏理论 + 综合K线 + 竖版信息图
+金融技术分析图生成器 —— 缠论 + 头肩底 + 筹码 + 三档理论 + 综合K线 + 竖版信息图
 
 Usage:
     python generate_analysis.py --symbol sh000001 --name 上证指数 --days 60
@@ -1525,12 +1525,19 @@ class ThreeGearsAnalyzer:
 class HeadAndShouldersBottom:
     """头肩底（Inverse Head and Shoulders）形态识别器。
 
-    识别逻辑：
-    1. 在下跌趋势末期寻找三个连续的低点（左肩、头、右肩）
-    2. 头部最低，两肩高度相近（差异<15%）
-    3. 两肩之间的反弹高点构成颈线
-    4. 当前价格接近或突破颈线时触发信号
+    全历史多级别检测：
+    - 大周期(order=8): 跨季度/年级别的大头肩底
+    - 中周期(order=5): 月级别头肩底
+    - 小周期(order=3): 周级别头肩底
+
+    支持完整形态（左肩+头+右肩）和部分形态（左肩+头，右肩形成中）。
     """
+
+    SCALES = [
+        ("大周期", 8, 15),
+        ("中周期", 5, 8),
+        ("小周期", 3, 5),
+    ]
 
     def __init__(self, df: pd.DataFrame):
         self.df = df.copy().reset_index(drop=True)
@@ -1558,36 +1565,105 @@ class HeadAndShouldersBottom:
                 swing_highs.append((i, float(highs[i])))
         return swing_highs
 
-    def detect(self, min_lookback=30, max_lookback=200):
-        """检测头肩底形态。"""
+    def _make_pattern(self, df, left_i, head_i, right_i,
+                      left_price, head_price, right_price,
+                      neckline_price, neck_p1, neck_p2,
+                      scale_name, stage=None):
+        """构造形态结果字典。"""
+        current_price = float(df["close"].iloc[-1])
+        distance_to_neck = (current_price - neckline_price) / neckline_price
+        head_depth = (neckline_price - head_price) / neckline_price
+        target_price = neckline_price + (neckline_price - head_price)
+
+        if stage is None:
+            if distance_to_neck > 0:
+                stage = "已突破"
+            elif distance_to_neck > -0.03:
+                stage = "接近颈线"
+            else:
+                stage = "形态形成中"
+
+        if stage == "已突破":
+            signal = "突破颈线，头肩底确认"
+            action = "买入信号"
+        elif stage == "接近颈线":
+            signal = "接近颈线，即将突破"
+            action = "关注突破"
+        elif stage == "右肩形成中":
+            signal = "左肩+头部已形成，右肩形成中"
+            action = "关注右肩形成"
+        else:
+            signal = "头肩底形态形成中"
+            action = "等待突破确认"
+
+        vol_pattern = ""
+        has_vol = "volume" in df.columns
+        vol_left = float(df["volume"].iloc[left_i]) if has_vol else 0
+        vol_head = float(df["volume"].iloc[head_i]) if has_vol else 0
+        vol_right = float(df["volume"].iloc[right_i]) if has_vol and right_i is not None else 0
+
+        if right_i is not None and vol_head > 0 and vol_left > 0 and vol_right > 0:
+            if vol_left > vol_head and vol_right > vol_head:
+                vol_pattern = "缩量筑底（左肩和右肩量能大于头部，理想形态）"
+            elif vol_right > vol_left:
+                vol_pattern = "右肩放量（突破动力较强）"
+            else:
+                vol_pattern = "量能一般"
+
+        pattern = {
+            "scale": scale_name,
+            "stage": stage,
+            "left_shoulder": {"idx": int(left_i), "price": round(left_price, 2),
+                              "date": str(df["date"].iloc[left_i].date())},
+            "head": {"idx": int(head_i), "price": round(head_price, 2),
+                     "date": str(df["date"].iloc[head_i].date())},
+            "neckline": round(neckline_price, 2),
+            "head_depth": round(float(head_depth) * 100, 2),
+            "distance_to_neckline": round(float(distance_to_neck) * 100, 2),
+            "target_price": round(target_price, 2),
+            "signal": signal,
+            "action": action,
+            "volume_pattern": vol_pattern,
+            "current_price": round(current_price, 2),
+        }
+
+        if right_i is not None:
+            pattern["right_shoulder"] = {"idx": int(right_i), "price": round(right_price, 2),
+                                         "date": str(df["date"].iloc[right_i].date())}
+        else:
+            pattern["right_shoulder"] = None
+
+        if neck_p1 is not None and neck_p2 is not None:
+            pattern["neckline_points"] = [
+                {"idx": int(neck_p1[0]), "price": round(neck_p1[1], 2)},
+                {"idx": int(neck_p2[0]), "price": round(neck_p2[1], 2)},
+            ]
+
+        return pattern
+
+    def _detect_complete(self, scale_name, order, min_distance):
+        """检测完整头肩底形态（左肩+头+右肩）。"""
         df = self.df
-        n = len(df)
-        start = max(0, n - max_lookback)
-        end = n
-        df_range = df.iloc[start:end].reset_index(drop=True)
-
-        swing_lows = self._find_swing_lows(order=3)
-        swing_highs = self._find_swing_highs(order=3)
-
-        swing_lows = [(i, p) for i, p in swing_lows if start <= i < end]
-        swing_highs = [(i, p) for i, p in swing_highs if start <= i < end]
+        swing_lows = self._find_swing_lows(order=order)
+        swing_highs = self._find_swing_highs(order=order)
 
         if len(swing_lows) < 3 or len(swing_highs) < 2:
-            return self.patterns
+            return []
 
+        found = []
         for head_idx in range(1, len(swing_lows) - 1):
             head_i, head_price = swing_lows[head_idx]
             left_i, left_price = swing_lows[head_idx - 1]
             right_i, right_price = swing_lows[head_idx + 1]
 
-            if head_i - left_i < 3 or right_i - head_i < 3:
+            if head_i - left_i < min_distance or right_i - head_i < min_distance:
                 continue
 
             if not (head_price < left_price and head_price < right_price):
                 continue
 
             shoulder_diff = abs(left_price - right_price) / min(left_price, right_price)
-            if shoulder_diff > 0.15:
+            if shoulder_diff > 0.20:
                 continue
 
             neckline_highs = [(i, p) for i, p in swing_highs
@@ -1606,66 +1682,167 @@ class HeadAndShouldersBottom:
 
             current_price = float(df["close"].iloc[-1])
             distance_to_neck = (current_price - neckline_price) / neckline_price
-
-            if distance_to_neck > 0.10:
+            if distance_to_neck > 0.15 or distance_to_neck < -0.30:
                 continue
 
-            if distance_to_neck > 0:
-                signal = "突破颈线，头肩底确认"
-                action = "买入信号"
-            elif distance_to_neck > -0.03:
-                signal = "接近颈线，即将突破"
-                action = "关注突破"
+            pattern = self._make_pattern(
+                df, left_i, head_i, right_i,
+                left_price, head_price, right_price,
+                neckline_price, neck_p1, neck_p2,
+                scale_name,
+            )
+            found.append(pattern)
+
+        return found
+
+    def _detect_partial(self, scale_name, order, min_distance):
+        """检测部分头肩底形态（左肩+头部已形成，右肩形成中）。
+
+        逻辑：取最后两个 swing low，如果 head < left_shoulder，
+        且当前价格已从头部反弹，则视为右肩正在形成。
+        """
+        df = self.df
+        n = len(df)
+        swing_lows = self._find_swing_lows(order=order)
+        swing_highs = self._find_swing_highs(order=order)
+
+        if len(swing_lows) < 2 or len(swing_highs) < 1:
+            return []
+
+        found = []
+        # 只看最近的 swing low pair，避免找到太多历史遗留
+        for head_idx in range(max(0, len(swing_lows) - 3), len(swing_lows)):
+            if head_idx == 0:
+                continue
+            head_i, head_price = swing_lows[head_idx]
+            left_i, left_price = swing_lows[head_idx - 1]
+
+            if head_i - left_i < min_distance:
+                continue
+
+            if not (head_price < left_price):
+                continue
+
+            # 头部之后没有形成新的 swing low（即右肩尚未确认）
+            subsequent_lows = [(i, p) for i, p in swing_lows if i > head_i]
+            if not subsequent_lows:
+                # head 是最后一个 swing low，右肩尚未形成
+                pass
             else:
-                signal = "头肩底形态形成中"
-                action = "等待突破确认"
+                # 如果后续已有 swing low，检查是否已经有完整形态（跳过）
+                # 如果后续 swing low 价格与左肩接近，说明完整形态可能在 _detect_complete 中
+                continue
 
-            volume_left = float(df["volume"].iloc[left_i]) if "volume" in df.columns else 0
-            volume_head = float(df["volume"].iloc[head_i]) if "volume" in df.columns else 0
-            volume_right = float(df["volume"].iloc[right_i]) if "volume" in df.columns else 0
-            vol_pattern = ""
-            if volume_head > 0 and volume_left > 0 and volume_right > 0:
-                if volume_left > volume_head and volume_right > volume_head:
-                    vol_pattern = "缩量筑底（左肩和右肩量能大于头部，理想形态）"
-                elif volume_right > volume_left:
-                    vol_pattern = "右肩放量（突破动力较强）"
-                else:
-                    vol_pattern = "量能一般"
+            # 构造预估颈线：左肩和头部之间的 swing high
+            neckline_highs = [(i, p) for i, p in swing_highs
+                              if left_i < i < head_i and p > head_price]
+            if len(neckline_highs) < 1:
+                # 用 head 之后到当前之间的 high 补充
+                post_highs = [(i, p) for i, p in swing_highs
+                              if i > head_i and p > head_price]
+                if not post_highs:
+                    continue
+                neckline_highs.extend(post_highs)
 
-            target_price = neckline_price + (neckline_price - head_price)
+            if not neckline_highs:
+                continue
 
-            self.patterns.append({
-                "left_shoulder": {"idx": int(left_i), "price": round(left_price, 2),
-                                  "date": str(df["date"].iloc[left_i].date())},
-                "head": {"idx": int(head_i), "price": round(head_price, 2),
-                         "date": str(df["date"].iloc[head_i].date())},
-                "right_shoulder": {"idx": int(right_i), "price": round(right_price, 2),
-                                   "date": str(df["date"].iloc[right_i].date())},
-                "neckline": round(neckline_price, 2),
-                "neckline_points": [
-                    {"idx": int(neck_p1[0]), "price": round(neck_p1[1], 2)},
-                    {"idx": int(neck_p2[0]), "price": round(neck_p2[1], 2)},
-                ],
-                "head_depth": round(float(head_depth) * 100, 2),
-                "distance_to_neckline": round(float(distance_to_neck) * 100, 2),
-                "target_price": round(target_price, 2),
-                "signal": signal,
-                "action": action,
-                "volume_pattern": vol_pattern,
-                "current_price": round(current_price, 2),
-            })
+            neckline_highs.sort(key=lambda x: x[0])
+            neck_p1 = neckline_highs[0]
+            neck_p2 = neckline_highs[-1]
+            neckline_price = (neck_p1[1] + neck_p2[1]) / 2.0
 
-        self.patterns.sort(key=lambda x: abs(x["distance_to_neckline"]))
+            head_depth = (neckline_price - head_price) / neckline_price
+            if head_depth < 0.03:
+                continue
+
+            current_price = float(df["close"].iloc[-1])
+            distance_to_neck = (current_price - neckline_price) / neckline_price
+
+            # 右肩形成中：当前价格在头部和颈线之间，且已经反弹
+            head_to_neck = neckline_price - head_price
+            if head_to_neck <= 0:
+                continue
+
+            rebound_ratio = (current_price - head_price) / head_to_neck
+            if rebound_ratio < 0.3:
+                # 反弹不够，还太弱
+                continue
+
+            # 当前价格不能太高（已经在颈线以上的让完整形态去处理）
+            if distance_to_neck > 0.05:
+                continue
+
+            pattern = self._make_pattern(
+                df, left_i, head_i, None,
+                left_price, head_price, None,
+                neckline_price, neck_p1, neck_p2,
+                scale_name,
+                stage="右肩形成中",
+            )
+            found.append(pattern)
+
+        return found
+
+    def detect(self):
+        """全历史多级别检测头肩底形态。"""
+        self.patterns = []
+        by_scale = {}
+
+        for scale_name, order, min_distance in self.SCALES:
+            complete = self._detect_complete(scale_name, order, min_distance)
+            partial = self._detect_partial(scale_name, order, min_distance)
+            scale_patterns = complete + partial
+            by_scale[scale_name] = scale_patterns
+            self.patterns.extend(scale_patterns)
+
+        # 去重：如果小周期形态的 head 落在大周期形态的范围内，移除小周期的
+        self._dedup_patterns()
+        # 重建去重后的 by_scale
+        by_scale = {}
+        for p in self.patterns:
+            by_scale.setdefault(p["scale"], []).append(p)
+        self.patterns.sort(key=lambda x: (
+            0 if x["scale"] == "大周期" else 1 if x["scale"] == "中周期" else 2,
+            abs(x["distance_to_neckline"]),
+        ))
+        self._by_scale = by_scale
         return self.patterns
+
+    def _dedup_patterns(self):
+        """去除被大周期包含的小周期重复形态，以及跨周期 head 相同的重复。"""
+        to_remove = set()
+        scale_order = {"大周期": 0, "中周期": 1, "小周期": 2}
+        for i in range(len(self.patterns)):
+            if i in to_remove:
+                continue
+            pi = self.patterns[i]
+            for j in range(i + 1, len(self.patterns)):
+                if j in to_remove:
+                    continue
+                pj = self.patterns[j]
+                # 同一 head 位置且价格接近 → 保留大周期的
+                if pi["head"]["idx"] == pj["head"]["idx"] and \
+                   abs(pi["head"]["price"] - pj["head"]["price"]) / max(pi["head"]["price"], 1) < 0.03:
+                    if scale_order.get(pi["scale"], 9) > scale_order.get(pj["scale"], 9):
+                        to_remove.add(i)
+                        break
+                    else:
+                        to_remove.add(j)
+                        continue
+        if to_remove:
+            self.patterns = [p for i, p in enumerate(self.patterns) if i not in to_remove]
 
     def analyze(self):
         self.detect()
         best = self.patterns[0] if self.patterns else None
+        by_scale = getattr(self, "_by_scale", {})
         return {
             "detected": len(self.patterns) > 0,
             "pattern_count": len(self.patterns),
             "best_pattern": best,
             "all_patterns": self.patterns,
+            "by_scale": {k: v for k, v in by_scale.items() if v},
         }
 
 
@@ -1992,8 +2169,15 @@ def generate_chanlun_chart(df, analysis, name, output_path):
         if sidx < len(df) and eidx < len(df):
             sp = float(pen["start_price"])
             ep = float(pen["end_price"])
-            color = "#3498db" if pen["direction"] == "up" else "#e67e22"
-            ax_price.plot([xvals[sidx], xvals[eidx]], [sp, ep], color=color, linewidth=1.5, linestyle="--", alpha=0.8)
+            ax_price.plot([xvals[sidx], xvals[eidx]], [sp, ep], color="white", linewidth=1.8, solid_capstyle="round", alpha=0.9)
+
+    # 分型标记
+    for idx in top_fractals:
+        if idx < len(df):
+            ax_price.scatter([xvals[idx]], [float(df["high"].iloc[idx])], marker="v", s=30, color="#ff6b6b", zorder=5)
+    for idx in bottom_fractals:
+        if idx < len(df):
+            ax_price.scatter([xvals[idx]], [float(df["low"].iloc[idx])], marker="^", s=30, color="#51cf66", zorder=5)
 
     # 中枢
     for center in centers:
@@ -2051,6 +2235,160 @@ def generate_chanlun_chart(df, analysis, name, output_path):
     fig.savefig(output_path, dpi=150, facecolor="#1a1a2e", edgecolor="none")
     plt.close(fig)
     print(f"[chart] 缠论图已保存: {output_path}")
+    return output_path
+
+
+def generate_hsb_chart(df, analysis, name, output_path):
+    """
+    头肩底颈线分析图。
+    - K线 + 左肩/头部/右肩标记
+    - 颈线（水平虚线）+ 目标价线
+    - 形态区域半透明标注
+    - 成交量副图
+    - 深色背景 #1a1a2e
+    """
+    hs = analysis.get("head_shoulders_bottom", {})
+    if not hs or not hs.get("detected") or not hs.get("best_pattern"):
+        print(f"[chart] 头肩底未检测到，跳过图表生成")
+        return None
+
+    bp = hs["best_pattern"]
+    left = bp.get("left_shoulder")
+    head = bp.get("head")
+    right = bp.get("right_shoulder")
+    neckline = bp.get("neckline")
+    target = bp.get("target_price")
+    neck_points = bp.get("neckline_points")
+
+    if not left or not head or not neckline:
+        print(f"[chart] 头肩底数据不完整，跳过图表生成")
+        return None
+
+    fig, axes = plt.subplots(2, 1, figsize=(16, 9), gridspec_kw={"height_ratios": [4, 1]}, facecolor="#1a1a2e")
+    ax_price = axes[0]
+    ax_vol = axes[1]
+
+    for ax in axes:
+        ax.set_facecolor("#1a1a2e")
+        ax.tick_params(colors="white")
+        for spine in ax.spines.values():
+            spine.set_color("#444444")
+
+    xvals = np.arange(len(df))
+    plot_candles(ax_price, df, xvals)
+
+    # 形态区域半透明背景
+    left_idx = int(left["idx"])
+    rightmost_idx = int(right["idx"]) if right else int(head["idx"])
+    head_idx = int(head["idx"])
+    if left_idx < len(xvals) and rightmost_idx < len(xvals):
+        lo_region = float(df["low"].iloc[left_idx:rightmost_idx + 1].min())
+        ax_price.axvspan(xvals[left_idx], xvals[rightmost_idx],
+                         alpha=0.08, color="#f1c40f", zorder=0)
+
+    # 颈线
+    if neck_points and len(neck_points) >= 2:
+        np1, np2 = neck_points[0], neck_points[1]
+        ni1, np1_price = int(np1["idx"]), float(np1["price"])
+        ni2, np2_price = int(np2["idx"]), float(np2["price"])
+        # 延长到全图范围
+        extend_start = 0
+        extend_end = len(xvals) - 1
+        if ni2 != ni1:
+            slope = (np2_price - np1_price) / (ni2 - ni1)
+            ext_start_price = np1_price + slope * (extend_start - ni1)
+            ext_end_price = np2_price + slope * (extend_end - ni2)
+        else:
+            ext_start_price = neckline
+            ext_end_price = neckline
+        ax_price.plot([xvals[extend_start], xvals[extend_end]],
+                      [ext_start_price, ext_end_price],
+                      color="#f1c40f", linewidth=2.0, linestyle="--", alpha=0.9, label=f"颈线 {neckline:.2f}")
+    else:
+        ax_price.axhline(neckline, color="#f1c40f", linewidth=2.0, linestyle="--", alpha=0.9, label=f"颈线 {neckline:.2f}")
+
+    # 目标价线
+    if target:
+        ax_price.axhline(target, color="#2ecc71", linewidth=1.5, linestyle=":", alpha=0.8, label=f"目标价 {target:.2f}")
+
+    # 左肩标记
+    if left_idx < len(xvals):
+        ax_price.scatter([xvals[left_idx]], [float(left["price"])],
+                         marker="^", s=120, color="#3498db", zorder=6, edgecolors="white", linewidths=1)
+        ax_price.annotate(f"左肩\n{left['price']:.2f}",
+                          xy=(xvals[left_idx], float(left["price"])),
+                          xytext=(0, -30), textcoords="offset points",
+                          fontsize=9, color="#3498db", fontweight="bold",
+                          arrowprops=dict(arrowstyle="->", color="#3498db"))
+
+    # 头部标记
+    if head_idx < len(xvals):
+        ax_price.scatter([xvals[head_idx]], [float(head["price"])],
+                         marker="^", s=150, color="#e74c3c", zorder=6, edgecolors="white", linewidths=1)
+        ax_price.annotate(f"头部\n{head['price']:.2f}",
+                          xy=(xvals[head_idx], float(head["price"])),
+                          xytext=(0, -35), textcoords="offset points",
+                          fontsize=9, color="#e74c3c", fontweight="bold",
+                          arrowprops=dict(arrowstyle="->", color="#e74c3c"))
+
+    # 右肩标记
+    if right and int(right["idx"]) < len(xvals):
+        right_idx = int(right["idx"])
+        ax_price.scatter([xvals[right_idx]], [float(right["price"])],
+                         marker="^", s=120, color="#9b59b6", zorder=6, edgecolors="white", linewidths=1)
+        ax_price.annotate(f"右肩\n{right['price']:.2f}",
+                          xy=(xvals[right_idx], float(right["price"])),
+                          xytext=(0, -30), textcoords="offset points",
+                          fontsize=9, color="#9b59b6", fontweight="bold",
+                          arrowprops=dict(arrowstyle="->", color="#9b59b6"))
+
+    # 信号文字
+    signal = bp.get("signal", "")
+    stage = bp.get("stage", "")
+    action = bp.get("action", "")
+    info_text = f"信号: {signal}\n阶段: {stage}\n操作: {action}"
+    if target:
+        info_text += f"\n目标价: {target:.2f}"
+    ax_price.text(0.02, 0.97, info_text, transform=ax_price.transAxes,
+                  fontsize=10, color="#f1c40f", va="top", ha="left",
+                  bbox=dict(boxstyle="round,pad=0.4", facecolor="#1a1a2e", edgecolor="#f1c40f", alpha=0.85))
+
+    # 图例
+    ax_price.legend(loc="upper right", fontsize=9, facecolor="#1a1a2e", edgecolor="#444444", labelcolor="white")
+
+    # 价格轴范围
+    ymin = float(df["low"].min())
+    ymax = float(df["high"].max())
+    if target and target > ymax:
+        ymax = target
+    pad = (ymax - ymin) * 0.1
+    ax_price.set_ylim(ymin - pad, ymax + pad)
+
+    # 日期标签
+    date_range = f"{str(df['date'].iloc[0].date())} ~ {str(df['date'].iloc[-1].date())}"
+    scale = bp.get("scale", "")
+    ax_price.set_title(f"{name} 头肩底颈线分析 ({scale}) | {date_range}", fontsize=14, color="white", pad=10)
+
+    # x轴日期
+    n = len(df)
+    step = max(n // 10, 1)
+    tick_idx = list(range(0, n, step))
+    if tick_idx[-1] != n - 1:
+        tick_idx.append(n - 1)
+    for ax in axes:
+        ax.set_xticks([xvals[i] for i in tick_idx])
+        ax.set_xticklabels([str(df["date"].iloc[i].date()) for i in tick_idx], rotation=30, ha="right", color="white", fontsize=7)
+
+    # 成交量
+    if "volume" in df.columns:
+        colors_vol = ["#e74c3c" if df["close"].iloc[i] >= df["open"].iloc[i] else "#2ecc71" for i in range(len(df))]
+        ax_vol.bar(xvals, df["volume"].values, color=colors_vol, width=0.7, alpha=0.7)
+        ax_vol.set_ylabel("成交量", color="white", fontsize=9)
+
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=150, facecolor="#1a1a2e", edgecolor="none")
+    plt.close(fig)
+    print(f"[chart] 头肩底颈线分析图已保存: {output_path}")
     return output_path
 
 
@@ -2212,7 +2550,7 @@ def generate_infographic(df, report, output_path):
     hs = report.get("head_shoulders_bottom", {})
     if hs and hs.get("detected") and hs.get("best_pattern"):
         bp = hs["best_pattern"]
-        sections.append(("头肩底", f"{bp['signal']} 目标{bp['target_price']:.2f}"))
+        sections.append(("头肩底", f"[{bp.get('scale', '')}] {bp['signal']} 目标{bp['target_price']:.2f}"))
     ma = report.get("ma", {})
     if ma:
         latest_ma = ma.get("latest", {})
@@ -2413,7 +2751,8 @@ def build_report(df, chan_result, ma_result, cyq_result, cyq_signals, three_gear
     hs = head_shoulders_result
     if hs.get("detected") and hs.get("best_pattern"):
         bp = hs["best_pattern"]
-        recommendations.insert(0, f"头肩底: {bp['signal']}，目标价 {bp['target_price']:.2f}")
+        scale_tag = f"[{bp['scale']}]" if bp.get("scale") else ""
+        recommendations.insert(0, f"头肩底{scale_tag}: {bp['signal']}，目标价 {bp['target_price']:.2f}")
 
     # 缠论建议
     if chan_result.get("buy_sell_points"):
@@ -2566,12 +2905,14 @@ def main():
     ma_result = analyze_ma_arrangement(df_visible)
     macd_result = analyze_macd_cross(df_visible)
 
-    # 3. 头肩底识别
-    print("[main] 头肩底形态识别...")
-    hs_detector = HeadAndShouldersBottom(df_visible)
+    # 3. 头肩底识别（使用全历史K线，多级别检测）
+    print("[main] 头肩底形态识别（全历史多级别）...")
+    hs_detector = HeadAndShouldersBottom(df_full)
     head_shoulders_result = hs_detector.analyze()
     if head_shoulders_result["detected"]:
-        print(f"[main] 发现 {head_shoulders_result['pattern_count']} 个头肩底形态")
+        scales = head_shoulders_result.get("by_scale", {})
+        scale_info = ", ".join(f"{k}×{len(v)}" for k, v in scales.items())
+        print(f"[main] 发现 {head_shoulders_result['pattern_count']} 个头肩底形态 ({scale_info})")
 
     # 4. 筹码分析
     print("[main] 筹码分布分析...")
@@ -2658,15 +2999,16 @@ def main():
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         prefix = f"{market}{code}"
 
-        # 三档图（使用全量K线）
-        dow_path = os.path.join(args.output_dir, f"dow_{prefix}_{ts}.png")
-        generate_dow_chart(df_full, report, args.name, dow_path)
-        paths["dow"] = dow_path
-
         # 缠论图
         chan_path = os.path.join(args.output_dir, f"chanlun_{prefix}_{ts}.png")
         generate_chanlun_chart(df_visible, report, args.name, chan_path)
         paths["chanlun"] = chan_path
+
+        # 头肩底颈线分析图
+        hsb_path = os.path.join(args.output_dir, f"hsb_{prefix}_{ts}.png")
+        hsb_result = generate_hsb_chart(df_full, report, args.name, hsb_path)
+        if hsb_result:
+            paths["hsb"] = hsb_path
 
         # 筹码图（使用全量K线）
         cyq_path = os.path.join(args.output_dir, f"cyq_{prefix}_{ts}.png")

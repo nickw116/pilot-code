@@ -5,6 +5,17 @@
         :class="['message-item', msg.role]"
       >
         <div class="bubble">
+          <div v-if="msg.thinking" class="thinking-block">
+            <div class="thinking-header" @click="msg._thinkingExpanded = !msg._thinkingExpanded">
+              <span class="thinking-icon">💭</span>
+              <span class="thinking-label">思考中...</span>
+              <span class="thinking-toggle">{{ msg._thinkingExpanded === false ? '展开' : '收起' }}</span>
+            </div>
+            <div v-if="msg._thinkingExpanded !== false" class="thinking-content">
+              {{ msg.thinking }}
+              <span v-if="msg.isStreaming" class="typing-cursor"></span>
+            </div>
+          </div>
           <div v-if="msg.content || (msg.media && (msg.media.images.length > 0 || msg.media.pdfs.length > 0))" class="text" :class="{ markdown: msg.role === 'assistant' }">
             <!-- 文本内容：优先用 media.text（已清理图片 URL），为空则 fallback 到原始 content，避免链接/文本被误过滤后整栏空白 -->
             <span v-if="getMsgRenderText(msg).trim()" v-html="msg.role === 'assistant' ? (msg._renderedCache || renderMarkdown(getMsgRenderText(msg))) : formatText(getMsgRenderText(msg))"></span>
@@ -78,6 +89,13 @@
               </svg>
             </div>
           </div>
+          <!-- ACP 日志面板 -->
+          <AcpLogPanel
+            v-if="props.currentAgentId === 'dev' && msg.role === 'assistant' && ((msg.acpLogs && msg.acpLogs.length > 0) || msg.isStreaming)"
+            :logs="msg.acpLogs || []"
+            :is-running="isAcpRunning(msg)"
+            :acp-status="msg.acpStatus || ''"
+          />
         </div>
       </div>
     </template>
@@ -88,12 +106,14 @@
 import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { formatText, renderMarkdown, previewImage } from '../utils/format.js'
 import { downloadFile } from '../utils/download.js'
+import AcpLogPanel from './AcpLogPanel.vue'
 
 const props = defineProps({
   messages: { type: Array, default: () => [] },
   loading: { type: Boolean, default: false },
   formatFileSize: { type: Function, default: () => '' },
   fileIcon: { type: Function, default: () => '📄' },
+  currentAgentId: { type: String, default: 'main' },
 })
 
 const emit = defineEmits(['loadMore'])
@@ -104,8 +124,10 @@ let observer = null
 const visibleMessages = computed(() =>
   props.messages.filter((msg) => {
     if (msg.content?.trim()) return true
+    if (msg.thinking?.trim()) return true
     if (msg.media?.images?.length || msg.media?.pdfs?.length) return true
     if (msg.steps?.length || msg.files?.length) return true
+    if (props.currentAgentId === 'dev' && msg.acpLogs?.length) return true
     if (msg.isStreaming) return true
     return false
   })
@@ -168,6 +190,17 @@ function handleImgError(e) {
 
 function handleDownload(file) {
   downloadFile(file)
+}
+
+function isAcpRunning(msg) {
+  if (msg.isStreaming) return true
+  const logs = msg.acpLogs
+  if (!logs || logs.length === 0) return false
+  for (let i = logs.length - 1; i >= 0; i--) {
+    if (logs[i].type === 'tool_start') return true
+    if (logs[i].type === 'tool_end') return false
+  }
+  return false
 }
 
 function downloadMediaUrl(url) {
@@ -570,6 +603,45 @@ defineExpose({ scrollToBottom })
 .code-block code .hljs-selector_tag { color: #89ddff; }
 .code-block code .hljs-type { color: #ffcb6b; }
 
+/* ── Thinking Block ── */
+.thinking-block {
+  margin-bottom: 8px;
+  border-left: 3px solid rgba(0, 122, 255, 0.3);
+  border-radius: 0 6px 6px 0;
+  background: rgba(0, 122, 255, 0.04);
+}
+.thinking-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  cursor: pointer;
+  user-select: none;
+}
+.thinking-icon {
+  font-size: 14px;
+}
+.thinking-label {
+  font-size: 12px;
+  color: #888;
+  flex: 1;
+}
+.thinking-toggle {
+  font-size: 11px;
+  color: var(--primary);
+  opacity: 0.7;
+}
+.thinking-content {
+  padding: 0 10px 8px;
+  font-size: 12px;
+  color: #888;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
 /* ── Thinking Animation ── */
 .thinking {
   display: flex;
@@ -604,17 +676,6 @@ defineExpose({ scrollToBottom })
   to { opacity: 1; transform: translateY(0); }
 }
 
-/* ── Steps (中间过程) ── */
-.steps-list {
-  margin-top: 8px;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 8px 10px;
-  background: rgba(0, 122, 255, 0.04);
-  border-radius: 10px;
-  border: 1px solid rgba(0, 122, 255, 0.1);
-}
 /* ── File Download Cards ── */
 .file-cards {
   margin-top: 10px;

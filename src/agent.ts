@@ -7,13 +7,15 @@ import {
 } from "@mariozechner/pi-ai";
 import fs from "fs";
 import path from "path";
-import { createUserTools, getUserWorkspaceDir } from "./tools.js";
+import { createUserTools, getUserWorkspaceDir, setAcpSseContext, clearAcpSseContext } from "./tools.js";
+import { describeImages, describeVideo, transcribeAudio } from "./media-provider.js";
 import { publish } from "./sse.js";
 import { bridgeAndPublish } from "./event-bridge.js";
-import { loadContext, appendContext, updateSessionTitle, type ContextMessage } from "./session.js";
+import { loadContext, appendContext, updateSessionTitle, setSessionStatus, type ContextMessage } from "./session.js";
 import { compactIfNeeded } from "./compaction.js";
 import { appendAuditLog } from "./audit.js";
 import { buildSkillSummary } from "./skills/index.js";
+import { buildMemoryContext, appendDailyNote } from "./memory.js";
 
 registerApiProvider({
   api: "openai-completions",
@@ -47,7 +49,7 @@ interface AgentsConfig {
 }
 
 let agentsConfig: AgentsConfig = { agents: [], models: {} };
-const configPath = path.join(import.meta.dirname, "..", "agents.json");
+const configPath = path.join(process.cwd(), "agents.json");
 if (fs.existsSync(configPath)) {
   try {
     agentsConfig = JSON.parse(fs.readFileSync(configPath, "utf-8"));
@@ -96,7 +98,7 @@ const deepseekModel: Model<any> = {
 };
 
 const DEFAULT_SYSTEM_PROMPT =
-  "你是 Pilot Code，一个智能编程助手。你可以读写文件、执行命令来帮助用户。请用中文回答。修改文件前先读取，使用 edit 做精确修改。如果 opencode 工具可用，复杂的多文件编辑、调试或重构任务可以委托给 opencode 处理。";
+  "你是 Pilot Agent，一个智能编程助手。你可以读写文件、执行命令来帮助用户。请用中文回答。修改文件前先读取，使用 edit 做精确修改。如果 claude_code 工具可用，复杂的多文件编辑、调试或重构任务可以委托给 Claude Code 处理。";
 
 // --- SessionLane: per-session serial queue ---
 
@@ -143,6 +145,7 @@ interface AgentEntry {
   agentId: string;
   userId: number;
   lastActivityAt: number;
+  disposeTools: () => Promise<void>;
 }
 
 const agents = new Map<string, AgentEntry>();
@@ -163,14 +166,21 @@ function getAgent(sessionKey: string, userId: number, modelId?: string, agentId?
 
   const resolvedAgentId = agentId || "main";
   const sk = sessionKey;
-  const userTools = createUserTools(
+  const { tools: userTools, dispose: disposeTools } = createUserTools(
     getUserWorkspaceDir(userId, resolvedAgentId),
     ac?.tools,
     () => currentImages.get(sk),
   );
 
   const skillSummary = buildSkillSummary();
-  const fullSystemPrompt = systemPrompt + skillSummary;
+
+  const workspaceDir = getUserWorkspaceDir(userId, resolvedAgentId);
+  const memoryContext = buildMemoryContext(workspaceDir);
+  const memorySection = memoryContext
+    ? `\n\n# 记忆系统\n以下是你的持久化记忆，跨会话保留。回答前先检查记忆中是否有相关信息：\n\n${memoryContext}`
+    : "";
+
+  const fullSystemPrompt = systemPrompt + skillSummary + memorySection;
 
   const agent = new Agent({
     initialState: {
@@ -190,19 +200,39 @@ function getAgent(sessionKey: string, userId: number, modelId?: string, agentId?
       return undefined;
     },
     convertToLlm: (messages) => messages as any[],
-    transformContext: compactIfNeeded,
+    transformContext: (messages) => compactIfNeeded(messages, (oldMessages) => {
+      try {
+        const noteLines: string[] = ["[compaction 前 memory flush]"];
+        for (const msg of oldMessages) {
+          const role = msg.role === "user" ? "用户" : "助手";
+          let text = "";
+          if (typeof msg.content === "string") {
+            text = msg.content;
+          } else if (Array.isArray(msg.content)) {
+            text = (msg.content as any[])
+              .filter((b: any) => b.type === "text")
+              .map((b: any) => b.text)
+              .join("");
+          }
+          if (text) {
+            noteLines.push(`${role}: ${text.length > 300 ? text.slice(0, 300) + "..." : text}`);
+          }
+        }
+        appendDailyNote(workspaceDir, noteLines.join("\n"));
+        console.log(`[memory] flushed ${oldMessages.length} old messages to daily note before compaction`);
+      } catch (err) {
+        console.error("[memory] compaction flush failed:", err);
+      }
+    }),
     toolExecution: "sequential",
   });
 
   const history = loadContext(sessionKey);
   if (history.length > 0) {
-    const MAX_HISTORY = 20;
-    const MAX_MSG_LEN = 500;
-    const recent = history.slice(-MAX_HISTORY);
+    const recent = history.slice(-10);
     const lines = recent.map((m) => {
       const label = m.role === "user" ? "User" : "Assistant";
-      const text = (m.content || "").slice(0, MAX_MSG_LEN);
-      return `${label}: ${text}`;
+      return `${label}: ${m.content || ""}`;
     });
     const contextMsg = {
       role: "user" as const,
@@ -218,7 +248,7 @@ function getAgent(sessionKey: string, userId: number, modelId?: string, agentId?
     if (runId) bridgeAndPublish(event, runId, sessionKey);
   });
 
-  agents.set(sessionKey, { agent, modelId: resolvedModelId, agentId: agentId || "main", userId, lastActivityAt: Date.now() });
+  agents.set(sessionKey, { agent, modelId: resolvedModelId, agentId: agentId || "main", userId, lastActivityAt: Date.now(), disposeTools });
   return agent;
 }
 
@@ -242,7 +272,7 @@ function getApiKeyForProvider(provider: string): string | undefined {
 
 const currentRunIds = new Map<string, string>();
 
-async function doRunPromptWithRunId(runId: string, message: string, sessionKey: string, userId: number, agentId?: string, images?: ImageContent[]): Promise<string> {
+async function doRunPromptWithRunId(runId: string, message: string, sessionKey: string, userId: number, agentId?: string, images?: ImageContent[], videos?: Array<{ data: string; mimeType: string }>, audios?: Array<{ data: string; mimeType: string }>): Promise<string> {
   const entry = agents.get(sessionKey);
   const modelId = entry?.modelId || "xiaomi/mimo-v2.5";
   const agent = getAgent(sessionKey, userId, modelId, agentId);
@@ -272,14 +302,50 @@ async function doRunPromptWithRunId(runId: string, message: string, sessionKey: 
     return runId;
   }
 
-  console.log(`[agent] doRun: model=${modelId} hasImages=${!!images} imageCount=${images?.length || 0}`);
+  console.log(`[agent] doRun: model=${modelId} hasImages=${!!images} imageCount=${images?.length || 0} hasVideos=${!!videos} videoCount=${videos?.length || 0} hasAudios=${!!audios} audioCount=${audios?.length || 0}`);
+
+  let effectiveMessage = message;
+  let effectiveImages = images;
 
   if (images && images.length > 0) {
     currentImages.set(sessionKey, images);
+    if (model && !model.input.includes("image")) {
+      console.log(`[agent] model ${modelId} does not support images, invoking media understanding layer`);
+      const description = await describeImages(images);
+      const label = images.length === 1 ? "[图片描述]" : `[${images.length}张图片描述]`;
+      effectiveMessage = `${effectiveMessage}\n\n${label}\n${description}`;
+      effectiveImages = undefined;
+    }
   }
 
+  if (videos && videos.length > 0) {
+    console.log(`[agent] processing ${videos.length} video(s) via media provider`);
+    const videoDescriptions = await Promise.all(
+      videos.map((v, i) => describeVideo(v.data, v.mimeType).then((d) => `[第${i + 1}个视频描述]\n${d}`).catch((e) => `[第${i + 1}个视频描述失败: ${e.message}]`)),
+    );
+    effectiveMessage = `${effectiveMessage}\n\n${videoDescriptions.join("\n\n")}`;
+  }
+
+  if (audios && audios.length > 0) {
+    console.log(`[agent] processing ${audios.length} audio(s) via media provider`);
+    const audioTranscripts = await Promise.all(
+      audios.map((a, i) => {
+        const format = a.mimeType.split("/")[1]?.replace(/^x-/, "") || "wav";
+        return transcribeAudio(a.data, format)
+          .then((t) => `[第${i + 1}段音频转录]\n${t}`)
+          .catch((e) => `[第${i + 1}段音频转录失败: ${e.message}]`);
+      }),
+    );
+    effectiveMessage = `${effectiveMessage}\n\n${audioTranscripts.join("\n\n")}`;
+  }
+
+  setSessionStatus(sessionKey, "generating", { runId });
+
+  setAcpSseContext(sessionKey, runId);
+
   try {
-    await agent.prompt(message, images);
+    await agent.prompt(effectiveMessage, effectiveImages);
+    setSessionStatus(sessionKey, "completed", { runId });
   } catch (err: any) {
     const errMsg = err?.message || "";
     console.error(`[agent] prompt failed: ${errMsg}`, err?.stack || "");
@@ -291,7 +357,9 @@ async function doRunPromptWithRunId(runId: string, message: string, sessionKey: 
       payload: { error: errMsg || "Agent error" },
     });
     errorMsg = errMsg || "Agent error";
+    setSessionStatus(sessionKey, "error", { runId, error: errorMsg });
   } finally {
+    clearAcpSseContext();
     currentRunIds.delete(sessionKey);
     currentImages.delete(sessionKey);
     const e = agents.get(sessionKey);
@@ -310,7 +378,7 @@ async function doRunPromptWithRunId(runId: string, message: string, sessionKey: 
       : (lastAssistant.content as any[])?.filter((b: any) => b.type === "text").map((b: any) => b.text).join("") || "";
     if (text) toSave.push({ role: "assistant", content: text, model: resolvedModelName });
   }
-  appendContext(sessionKey, toSave);
+  appendContext(sessionKey, toSave, runId);
 
   if (toSave.length > 1 && toSave[1]?.role === "assistant") {
     const firstUserMsg = loadContext(sessionKey).find((m) => m.role === "user");
@@ -333,10 +401,10 @@ async function doRunPromptWithRunId(runId: string, message: string, sessionKey: 
   return runId;
 }
 
-export function runPrompt(message: string, sessionKey: string, userId: number, agentId?: string, images?: ImageContent[]): Promise<string> {
+export function runPrompt(message: string, sessionKey: string, userId: number, agentId?: string, images?: ImageContent[], videos?: Array<{ data: string; mimeType: string }>, audios?: Array<{ data: string; mimeType: string }>): Promise<string> {
   const runId = crypto.randomUUID();
   const lane = getOrCreateLane(sessionKey);
-  lane.enqueue(() => doRunPromptWithRunId(runId, message, sessionKey, userId, agentId, images)).catch((err) => {
+  lane.enqueue(() => doRunPromptWithRunId(runId, message, sessionKey, userId, agentId, images, videos, audios)).catch((err) => {
     console.error("[agent] runPrompt unhandled:", err.message);
     publish(sessionKey, {
       eventId: "",
@@ -372,6 +440,8 @@ export function abort(sessionKey: string): void {
 }
 
 export function destroyAgent(sessionKey: string): void {
+  const entry = agents.get(sessionKey);
+  if (entry) entry.disposeTools().catch(() => {});
   agents.delete(sessionKey);
   currentRunIds.delete(sessionKey);
   lanes.delete(sessionKey);
@@ -413,6 +483,8 @@ export function switchModel(sessionKey: string, modelId: string, userId: number)
   const model = resolveModel(modelId);
   if (!model) return false;
 
+  const old = agents.get(sessionKey);
+  if (old) old.disposeTools().catch(() => {});
   agents.delete(sessionKey);
   getAgent(sessionKey, userId, modelId);
   console.log(`[agent] switched session ${sessionKey} to model ${modelId}`);
@@ -428,6 +500,7 @@ setInterval(() => {
   for (const [sk, entry] of agents) {
     if (now - entry.lastActivityAt > IDLE_TIMEOUT_MS) {
       console.log(`[lifecycle] evicting idle agent for session ${sk} (idle ${Math.round((now - entry.lastActivityAt) / 60000)}min)`);
+      entry.disposeTools().catch(() => {});
       agents.delete(sk);
       lanes.delete(sk);
     }
